@@ -1,0 +1,5 @@
+EMBEDDING_MODEL = "BAAI/bge-small-en"
+
+VECTOR_SIZE = 384
+
+COLLECTION_NAME = "documents"
