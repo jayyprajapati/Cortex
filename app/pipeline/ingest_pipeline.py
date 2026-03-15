@@ -17,5 +17,11 @@ def ingest_document(path, doc_id):
     chunks = create_chunks(elements, doc_id)
 
     embeddings = embed_chunks(chunks)
-
+    print("\nCHUNKS TO STORE:")
+    for c in chunks:
+        print("-----")
+        print("chunk_id:", c.chunk_id)
+        print("section:", c.section)
+        print("page:", c.page)
+        print(c.text[:300])
     store_chunks(chunks, embeddings)

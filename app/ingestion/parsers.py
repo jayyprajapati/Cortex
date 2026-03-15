@@ -1,18 +1,29 @@
 import fitz
 # This module provides functions to parse simple documents and extract text content using PyMuPDF.
+import fitz
+
+
 def parse_pdf_simple(path):
-
     doc = fitz.open(path)
-
-    pages = []
+    elements = []
 
     for i, page in enumerate(doc):
-        pages.append({
-            "text": page.get_text(),
-            "page": i + 1
-        })
+        blocks = page.get_text("blocks")
 
-    return pages
+        for block in blocks:
+            text = block[4].strip()
+            if not text:
+                continue
+
+            # normalize wrapped lines inside the same block
+            text = " ".join(line.strip() for line in text.splitlines() if line.strip())
+
+            elements.append({
+                "text": text,
+                "page": i + 1
+            })
+
+    return elements
 
 # For more complex documents, we can use the unstructured library to extract text and metadata from PDFs.
 from unstructured.partition.pdf import partition_pdf
