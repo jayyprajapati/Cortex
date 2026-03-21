@@ -3,22 +3,33 @@ from app.llm.factory import get_llm
 
 
 def build_prompt(query, chunks):
-    context = "\n\n".join([c["text"] for c in chunks])
+    context_blocks = []
+
+    for i, c in enumerate(chunks):
+        context_blocks.append(
+            f"[Source {i+1} | Section: {c.get('section')} | Page: {c.get('page')}]\n{c['text']}"
+        )
+
+    context = "\n\n".join(context_blocks)
 
     return f"""
-You are a helpful assistant.
+        You are a precise and reliable assistant.
 
-Answer the question using ONLY the context below.
-Cite the source section and page in your answer.
+        You MUST follow these rules:
+        - Answer ONLY using the provided context.
+        - DO NOT use any outside knowledge.
+        - If the answer is not clearly present, dont use your own knowledge to fill in the gaps.
+        - Keep the answer concise but complete.
+        - ALWAYS include source references inline using [Source X].
 
-Context:
-{context}
+        Context:
+        {context}
 
-Question:
-{query}
+        Question:
+        {query}
 
-Answer:
-"""
+        Answer:
+    """
 
 
 def generate_answer(query, llm_config):
