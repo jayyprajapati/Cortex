@@ -47,3 +47,7 @@ def store_chunks(chunks, embeddings):
         collection_name="documents",
         points=points
     )
+
+def get_collection_size(collection_name="documents"):
+    info = client.get_collection(collection_name)
+    return info.points_count
