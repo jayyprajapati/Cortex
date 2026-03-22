@@ -1,8 +1,40 @@
-import fitz
-# This module provides functions to parse simple documents and extract text content using PyMuPDF.
-import fitz
+import fitz  # PyMuPDF
 
 
+# -------------------------------
+# OPTIONAL: unstructured (for complex PDFs)
+# -------------------------------
+try:
+    from unstructured.partition.pdf import partition_pdf
+    UNSTRUCTURED_AVAILABLE = True
+except ImportError:
+    UNSTRUCTURED_AVAILABLE = False
+
+
+# -------------------------------
+# OPTIONAL: DOCX
+# -------------------------------
+try:
+    from docx import Document
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+
+
+# -------------------------------
+# OPTIONAL: Markdown
+# -------------------------------
+try:
+    import markdown
+    from bs4 import BeautifulSoup
+    MARKDOWN_AVAILABLE = True
+except ImportError:
+    MARKDOWN_AVAILABLE = False
+
+
+# -------------------------------
+# SIMPLE PDF PARSER (PyMuPDF)
+# -------------------------------
 def parse_pdf_simple(path):
     doc = fitz.open(path)
     elements = []
@@ -15,7 +47,7 @@ def parse_pdf_simple(path):
             if not text:
                 continue
 
-            # normalize wrapped lines inside the same block
+            # normalize wrapped lines
             text = " ".join(line.strip() for line in text.splitlines() if line.strip())
 
             elements.append({
@@ -25,10 +57,15 @@ def parse_pdf_simple(path):
 
     return elements
 
-# For more complex documents, we can use the unstructured library to extract text and metadata from PDFs.
-from unstructured.partition.pdf import partition_pdf
 
+# -------------------------------
+# COMPLEX PDF PARSER (Unstructured - OPTIONAL)
+# -------------------------------
 def parse_pdf_complex(path):
+
+    if not UNSTRUCTURED_AVAILABLE:
+        print("⚠️ Unstructured not available, falling back to PyMuPDF")
+        return parse_pdf_simple(path)
 
     elements = partition_pdf(path)
 
@@ -44,10 +81,14 @@ def parse_pdf_complex(path):
 
     return docs
 
-# For Word documents, we can use the python-docx library to extract text from paragraphs.
-from docx import Document
 
+# -------------------------------
+# DOCX PARSER (OPTIONAL)
+# -------------------------------
 def parse_docx(path):
+
+    if not DOCX_AVAILABLE:
+        raise ImportError("python-docx is not installed")
 
     doc = Document(path)
 
@@ -63,17 +104,19 @@ def parse_docx(path):
 
     return paragraphs
 
-# For Markdown files, we can convert the Markdown to HTML and then use BeautifulSoup to extract text from paragraphs and list items.
-import markdown
-from bs4 import BeautifulSoup
 
+# -------------------------------
+# MARKDOWN PARSER (OPTIONAL)
+# -------------------------------
 def parse_markdown(path):
+
+    if not MARKDOWN_AVAILABLE:
+        raise ImportError("markdown or beautifulsoup4 not installed")
 
     with open(path, "r") as f:
         text = f.read()
 
     html = markdown.markdown(text)
-
     soup = BeautifulSoup(html, "html.parser")
 
     paragraphs = []

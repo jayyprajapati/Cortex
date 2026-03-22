@@ -10,7 +10,7 @@ from app.vectorstore.qdrant_store import store_chunks
 # 3. Generates vector embeddings for the created chunks using the embed_chunks function, which utilizes a pre-trained sentence transformer model to encode the text into vector representations.
 # 4. Stores the chunks and their corresponding embeddings in a Qdrant vector database using the store_chunks function, which upserts the data into a collection for efficient retrieval during question-answering tasks.
 # This function is a critical part of the pipeline that ensures the processed and embedded chunks of text are stored in a way that facilitates fast and accurate retrieval when users query the system.
-def ingest_document(path, doc_id):
+def ingest_document(path, doc_id, user_id):
 
     elements = load_document(path)
 
@@ -24,4 +24,4 @@ def ingest_document(path, doc_id):
         print("section:", c.section)
         print("page:", c.page)
         print(c.text[:300])
-    store_chunks(chunks, embeddings)
+    store_chunks(chunks, embeddings, user_id)

@@ -23,7 +23,11 @@ def create_collection():
 # This function is a critical part of the pipeline that ensures the processed and embedded chunks of text are stored in a way that facilitates fast and accurate retrieval when users query the system.
 from qdrant_client.models import PointStruct
 
-def store_chunks(chunks, embeddings):
+def store_chunks(chunks, embeddings, user_id):
+
+    normalized_user_id = str(user_id).strip() if user_id is not None else ""
+    if not normalized_user_id:
+        raise ValueError("user_id is required for chunk storage")
 
     points = []
 
@@ -38,7 +42,8 @@ def store_chunks(chunks, embeddings):
                     "doc_id": chunk.doc_id,
                     "page": chunk.page,
                     "chunk_id": chunk.chunk_id,
-                    "section": chunk.section
+                    "section": chunk.section,
+                    "user_id": normalized_user_id,
                 }
             )
         )

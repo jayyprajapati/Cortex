@@ -32,17 +32,14 @@ def build_prompt(query, chunks):
     """
 
 
-def generate_answer(query, llm_config):
-    # Step 1: retrieve relevant chunks
-    chunks = retrieve(query)
+def generate_answer(query, llm_config, user_id, doc_id=None):
 
-    # Step 2: build prompt
+    chunks = retrieve(query, user_id=user_id, doc_id=doc_id)
+
     prompt = build_prompt(query, chunks)
 
-    # Step 3: get LLM
     llm = get_llm(llm_config)
 
-    # Step 4: generate answer
     answer = llm.generate(prompt)
 
     return {

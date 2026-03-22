@@ -17,7 +17,7 @@ llm_config = {
     "model": "gpt-oss:120b"
 }
 
-result = generate_answer(query, llm_config)
+result = generate_answer(query, llm_config, user_id="test_user")
 
 print("\nQUESTION:\n")
 print(query)
