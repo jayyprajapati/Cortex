@@ -56,6 +56,27 @@ def build_prompt(query, chunks, app_name="default"):
     return prompt_builder(query=query, context=context)
 
 
+def dedupe_chunks(chunks):
+    unique_chunks = []
+    seen = set()
+
+    for chunk in chunks:
+        key = (
+            str(chunk.get("doc_id") or "").strip(),
+            chunk.get("page"),
+            str(chunk.get("section") or "").strip(),
+            " ".join(str(chunk.get("text") or "").split()),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique_chunks.append(chunk)
+
+    return unique_chunks
+
+
 def generate_answer(query, *args, user_id=None, app_name="default", doc_id=None, llm_config=None):
     resolved_user_id = user_id
     resolved_app_name = app_name
@@ -92,12 +113,13 @@ def generate_answer(query, *args, user_id=None, app_name="default", doc_id=None,
         raise ValueError("user_id is required")
 
     chunks = retrieve(query, user_id=resolved_user_id, doc_id=resolved_doc_id)
+    chunks = dedupe_chunks(chunks)
 
     context = build_context(chunks)
     if not context.strip():
         return {
             "answer": NO_CONTEXT_FALLBACK,
-            "sources": [],
+            "sources": ["No relevant information found."],
         }
 
     prompt_builder = get_prompt_builder(resolved_app_name)
