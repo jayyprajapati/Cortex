@@ -1,37 +1,85 @@
-import os
-
-from app.config import OLLAMA_CLOUD_API_KEY
+from app.config import (
+    ALLOW_DEFAULT_LLM,
+    LLM_MODEL,
+    LLM_PROVIDER,
+    OLLAMA_CLOUD_API_KEY,
+    OPENAI_API_KEY,
+)
 from app.pipeline.retrieve_pipeline import retrieve
 from app.llm.factory import get_llm
 from cortex.prompts.registry import get_prompt_builder
 
 
-NO_CONTEXT_FALLBACK = "I could not find enough information in your documents to answer that question."
+NO_CONTEXT_FALLBACK = "No relevant information found."
+
+
+def _resolve_requested_llm_config(llm_config):
+    provider = str(llm_config.get("provider") or "").strip().lower()
+    model = llm_config.get("model")
+    api_key = str(llm_config.get("api_key") or "").strip()
+
+    if provider == "openai":
+        resolved_api_key = api_key
+
+        if not resolved_api_key and ALLOW_DEFAULT_LLM:
+            resolved_api_key = OPENAI_API_KEY
+
+        if not resolved_api_key:
+            raise ValueError("An API key is required for provider=openai.")
+
+        config = {
+            "provider": "openai",
+            "api_key": resolved_api_key,
+        }
+
+    elif provider in {"ollama", "ollama_cloud", "ollama_local"}:
+        if provider == "ollama_local":
+            config = {"provider": "ollama_local"}
+        elif api_key:
+            config = {
+                "provider": "ollama_cloud",
+                "api_key": api_key,
+            }
+        elif ALLOW_DEFAULT_LLM and OLLAMA_CLOUD_API_KEY:
+            config = {
+                "provider": "ollama_cloud",
+                "api_key": OLLAMA_CLOUD_API_KEY,
+            }
+        else:
+            config = {"provider": "ollama_local"}
+    else:
+        raise ValueError(f"Unsupported provider: {provider}")
+
+    if model:
+        config["model"] = model
+
+    return config
 
 
 def resolve_llm_config(llm_config=None):
     if llm_config:
-        return llm_config
+        return _resolve_requested_llm_config(llm_config)
 
-    provider = os.getenv("LLM_PROVIDER", "ollama_cloud")
-    model = os.getenv("LLM_MODEL")
+    provider = (LLM_PROVIDER or "ollama_cloud").strip().lower()
+    model = LLM_MODEL
 
-    if provider == "ollama_cloud":
+    if provider in {"ollama", "ollama_cloud"} and OLLAMA_CLOUD_API_KEY:
         config = {
             "provider": "ollama_cloud",
             "api_key": OLLAMA_CLOUD_API_KEY,
         }
     elif provider == "openai":
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
+        if not OPENAI_API_KEY:
             raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
 
         config = {
             "provider": "openai",
-            "api_key": api_key,
+            "api_key": OPENAI_API_KEY,
         }
-    else:
+    elif provider in {"ollama", "ollama_local", "ollama_cloud"}:
         config = {"provider": "ollama_local"}
+    else:
+        raise ValueError(f"Unsupported provider: {provider}")
 
     if model:
         config["model"] = model
@@ -119,7 +167,7 @@ def generate_answer(query, *args, user_id=None, app_name="default", doc_id=None,
     if not context.strip():
         return {
             "answer": NO_CONTEXT_FALLBACK,
-            "sources": ["No relevant information found."],
+            "sources": [],
         }
 
     prompt_builder = get_prompt_builder(resolved_app_name)
