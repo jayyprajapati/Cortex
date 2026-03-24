@@ -9,7 +9,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.llm.factory import get_llm
 from app.pipeline.generate_pipeline import generate_answer, resolve_llm_config
-from app.pipeline.ingest_pipeline import ingest_document, ingest_text
+from app.pipeline.ingest_pipeline import ingest_document, ingest_text, resolve_doc_id
 from app.vectorstore.qdrant_store import delete_document_vectors, delete_user_vectors
 
 app = FastAPI(title="Cortex RAG Engine")
@@ -56,7 +56,7 @@ class QueryRequest(BaseModel):
 
 class IngestRequest(BaseModel):
     user_id: str
-    doc_id: str
+    doc_id: Optional[str] = None
     file_path: Optional[str] = None
     text: Optional[str] = None
     llm: Optional[LLMOptions] = None
@@ -154,7 +154,7 @@ async def ingest_endpoint(request: Request):
 
         payload = IngestRequest(
             user_id=str(form.get("user_id") or "").strip(),
-            doc_id=str(form.get("doc_id") or "").strip(),
+            doc_id=(str(form.get("doc_id") or "").strip() or None),
             file_path=(str(form.get("file_path") or "").strip() or None),
             text=(str(form.get("text") or "").strip() or None),
             llm=_build_llm_options(
@@ -180,6 +180,7 @@ async def ingest_endpoint(request: Request):
         )
 
     temp_path = None
+    generated_doc_id = resolve_doc_id(payload.doc_id)
 
     try:
         if has_uploaded_file:
@@ -192,23 +193,23 @@ async def ingest_endpoint(request: Request):
                 temp_file.write(file_bytes)
                 temp_path = temp_file.name
 
-            chunks = ingest_document(
+            ingest_document(
                 path=temp_path,
-                doc_id=payload.doc_id,
+                doc_id=generated_doc_id,
                 user_id=payload.user_id,
                 api_key=(payload.llm.api_key if payload.llm else None),
             )
         elif has_path_file:
-            chunks = ingest_document(
+            ingest_document(
                 path=payload.file_path,
-                doc_id=payload.doc_id,
+                doc_id=generated_doc_id,
                 user_id=payload.user_id,
                 api_key=(payload.llm.api_key if payload.llm else None),
             )
         else:
-            chunks = ingest_text(
+            ingest_text(
                 text=payload.text,
-                doc_id=payload.doc_id,
+                doc_id=generated_doc_id,
                 user_id=payload.user_id,
             )
     except Exception as exc:
@@ -218,10 +219,8 @@ async def ingest_endpoint(request: Request):
             os.remove(temp_path)
 
     return {
-        "status": "ok",
-        "chunks_stored": len(chunks),
-        "doc_id": payload.doc_id,
-        "user_id": payload.user_id,
+        "status": "success",
+        "doc_id": generated_doc_id,
     }
 
 

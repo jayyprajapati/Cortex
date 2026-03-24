@@ -1,3 +1,5 @@
+import uuid
+
 from app.ingestion.loader import load_document
 from app.chunking.chunker import create_chunks
 from app.embeddings.embedder import embed_chunks
@@ -10,12 +12,22 @@ from app.vectorstore.qdrant_store import store_chunks
 # 3. Generates vector embeddings for the created chunks using the embed_chunks function, which utilizes a pre-trained sentence transformer model to encode the text into vector representations.
 # 4. Stores the chunks and their corresponding embeddings in a Qdrant vector database using the store_chunks function, which upserts the data into a collection for efficient retrieval during question-answering tasks.
 # This function is a critical part of the pipeline that ensures the processed and embedded chunks of text are stored in a way that facilitates fast and accurate retrieval when users query the system.
+def resolve_doc_id(doc_id):
+    normalized_doc_id = str(doc_id).strip() if doc_id is not None else ""
+    if normalized_doc_id:
+        return normalized_doc_id
+
+    return str(uuid.uuid4())
+
+
 def _ingest_elements(elements, doc_id, user_id):
 
-    chunks = create_chunks(elements, doc_id)
+    resolved_doc_id = resolve_doc_id(doc_id)
+
+    chunks = create_chunks(elements, resolved_doc_id)
 
     embeddings = embed_chunks(chunks)
-    print(f"Prepared {len(chunks)} chunks for doc_id={doc_id}")
+    print(f"Prepared {len(chunks)} chunks for doc_id={resolved_doc_id}")
     store_chunks(chunks, embeddings, user_id)
 
     return chunks

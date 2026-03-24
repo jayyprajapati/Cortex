@@ -32,6 +32,9 @@ def store_chunks(chunks, embeddings, user_id):
     points = []
 
     for chunk, vector in zip(chunks, embeddings):
+        normalized_doc_id = str(getattr(chunk, "doc_id", "") or "").strip()
+        if not normalized_doc_id:
+            raise ValueError("doc_id is required for chunk storage")
 
         points.append(
             PointStruct(
@@ -39,7 +42,7 @@ def store_chunks(chunks, embeddings, user_id):
                 vector=vector.tolist(),
                 payload={
                     "text": chunk.text,
-                    "doc_id": chunk.doc_id,
+                    "doc_id": normalized_doc_id,
                     "page": chunk.page,
                     "chunk_id": chunk.chunk_id,
                     "section": chunk.section,

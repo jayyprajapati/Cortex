@@ -59,8 +59,8 @@ def fetch_document_chunks(user_id, doc_id=None, limit=200):
         )
     ]
 
-    if doc_id:
-        normalized_doc_id = str(doc_id).strip()
+    normalized_doc_id = str(doc_id).strip() if doc_id is not None else ""
+    if normalized_doc_id:
         must_conditions.append(
             FieldCondition(
                 key="doc_id",
@@ -108,8 +108,8 @@ def search_documents(query_vector, user_id, doc_id=None, top_k=5):
         )
     ]
 
-    if doc_id:
-        normalized_doc_id = str(doc_id).strip()
+    normalized_doc_id = str(doc_id).strip() if doc_id is not None else ""
+    if normalized_doc_id:
         must_conditions.append(
             FieldCondition(
                 key="doc_id",
