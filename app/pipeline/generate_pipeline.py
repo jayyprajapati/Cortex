@@ -1,5 +1,4 @@
 from app.config import (
-    ALLOW_DEFAULT_LLM,
     LLM_MODEL,
     LLM_PROVIDER,
     OLLAMA_CLOUD_API_KEY,
@@ -19,18 +18,15 @@ def _resolve_requested_llm_config(llm_config):
     api_key = str(llm_config.get("api_key") or "").strip()
 
     if provider == "openai":
-        resolved_api_key = api_key
-
-        if not resolved_api_key and ALLOW_DEFAULT_LLM:
-            resolved_api_key = OPENAI_API_KEY
+        resolved_api_key = api_key or OPENAI_API_KEY
 
         if not resolved_api_key:
-            raise ValueError("An API key is required for provider=openai.")
-
-        config = {
-            "provider": "openai",
-            "api_key": resolved_api_key,
-        }
+            config = {"provider": "ollama_local"}
+        else:
+            config = {
+                "provider": "openai",
+                "api_key": resolved_api_key,
+            }
 
     elif provider in {"ollama", "ollama_cloud", "ollama_local"}:
         if provider == "ollama_local":
@@ -40,7 +36,7 @@ def _resolve_requested_llm_config(llm_config):
                 "provider": "ollama_cloud",
                 "api_key": api_key,
             }
-        elif ALLOW_DEFAULT_LLM and OLLAMA_CLOUD_API_KEY:
+        elif OLLAMA_CLOUD_API_KEY:
             config = {
                 "provider": "ollama_cloud",
                 "api_key": OLLAMA_CLOUD_API_KEY,
@@ -69,13 +65,13 @@ def resolve_llm_config(llm_config=None):
             "api_key": OLLAMA_CLOUD_API_KEY,
         }
     elif provider == "openai":
-        if not OPENAI_API_KEY:
-            raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
-
-        config = {
-            "provider": "openai",
-            "api_key": OPENAI_API_KEY,
-        }
+        if OPENAI_API_KEY:
+            config = {
+                "provider": "openai",
+                "api_key": OPENAI_API_KEY,
+            }
+        else:
+            config = {"provider": "ollama_local"}
     elif provider in {"ollama", "ollama_local", "ollama_cloud"}:
         config = {"provider": "ollama_local"}
     else:

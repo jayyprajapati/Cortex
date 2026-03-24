@@ -4,7 +4,7 @@ from qdrant_client.models import Filter, FieldCondition, MatchValue
 client = QdrantClient("localhost", port=6333)
 
 
-def list_user_document_ids(user_id, max_docs=1000):
+def list_user_document_ids(user_id, max_results=1000):
 
     normalized_user_id = str(user_id).strip() if user_id is not None else ""
     if not normalized_user_id:
@@ -22,7 +22,7 @@ def list_user_document_ids(user_id, max_docs=1000):
     doc_ids = set()
     offset = None
 
-    while len(doc_ids) < max_docs:
+    while len(doc_ids) < max_results:
         points, next_offset = client.scroll(
             collection_name="documents",
             scroll_filter=query_filter,

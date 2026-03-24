@@ -7,8 +7,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
-from app.config import ALLOW_DEFAULT_LLM, FREE_MAX_DOCS, FREE_MAX_QUERIES
-from app.usage.tracker import get_usage, increment_docs, increment_queries
 from app.llm.factory import get_llm
 from app.pipeline.generate_pipeline import generate_answer, resolve_llm_config
 from app.pipeline.ingest_pipeline import ingest_document, ingest_text
@@ -78,12 +76,6 @@ class DeleteAllRequest(BaseModel):
     user_id: str
 
 
-def _has_user_api_key(llm_options: Optional[LLMOptions]) -> bool:
-    if not llm_options:
-        return False
-    return bool((llm_options.api_key or "").strip())
-
-
 def _to_llm_config(llm_options: Optional[LLMOptions]):
     if not llm_options:
         return None
@@ -125,35 +117,14 @@ def root():
 
 @app.post("/query")
 def query_endpoint(payload: QueryRequest):
-    user_supplied_key = _has_user_api_key(payload.llm)
-
-    if not ALLOW_DEFAULT_LLM and not user_supplied_key:
-        raise HTTPException(
-            status_code=403,
-            detail="A user API key is required when ALLOW_DEFAULT_LLM is disabled.",
-        )
-
-    if not user_supplied_key:
-        usage = get_usage(payload.user_id)
-        if usage["queries"] >= FREE_MAX_QUERIES:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Free query limit exceeded ({FREE_MAX_QUERIES}). Provide an API key to continue.",
-            )
-
     try:
-        result = generate_answer(
+        return generate_answer(
             query=payload.query,
             user_id=payload.user_id,
             app_name=payload.app_name,
             doc_id=payload.doc_id,
             llm_config=_to_llm_config(payload.llm),
         )
-
-        if not user_supplied_key:
-            increment_queries(payload.user_id)
-
-        return result
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -208,22 +179,6 @@ async def ingest_endpoint(request: Request):
             detail="Provide exactly one of file_path, file, or text",
         )
 
-    user_supplied_key = _has_user_api_key(payload.llm)
-
-    if not ALLOW_DEFAULT_LLM and not user_supplied_key:
-        raise HTTPException(
-            status_code=403,
-            detail="A user API key is required when ALLOW_DEFAULT_LLM is disabled.",
-        )
-
-    if not user_supplied_key:
-        usage = get_usage(payload.user_id)
-        if usage["docs"] >= FREE_MAX_DOCS:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Free document limit exceeded ({FREE_MAX_DOCS}). Provide an API key to ingest more documents.",
-            )
-
     temp_path = None
 
     try:
@@ -256,9 +211,6 @@ async def ingest_endpoint(request: Request):
                 doc_id=payload.doc_id,
                 user_id=payload.user_id,
             )
-
-        if not user_supplied_key:
-            increment_docs(payload.user_id)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:

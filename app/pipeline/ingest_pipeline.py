@@ -1,6 +1,3 @@
-from app.config import FREE_MAX_PAGES
-from app.ingestion.inspector import inspect_pdf
-from app.ingestion.router import detect_file_type
 from app.ingestion.loader import load_document
 from app.chunking.chunker import create_chunks
 from app.embeddings.embedder import embed_chunks
@@ -24,21 +21,7 @@ def _ingest_elements(elements, doc_id, user_id):
     return chunks
 
 
-def _validate_document_limits(path, api_key=None):
-    file_type = detect_file_type(path)
-    user_api_key = (api_key or "").strip()
-
-    if file_type == "pdf" and not user_api_key:
-        meta = inspect_pdf(path)
-        if meta["pages"] > FREE_MAX_PAGES:
-            raise ValueError(
-                f"Free tier supports up to {FREE_MAX_PAGES} PDF pages. Provide an API key to ingest larger files."
-            )
-
-
 def ingest_document(path, doc_id, user_id, api_key=None):
-
-    _validate_document_limits(path, api_key=api_key)
 
     elements = load_document(path)
 
