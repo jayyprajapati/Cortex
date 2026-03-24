@@ -91,8 +91,12 @@ def build_context(chunks):
     context_blocks = []
 
     for i, chunk in enumerate(chunks):
+        section = str(chunk.get("section") or "Untitled").strip()
+        page = chunk.get("page")
+        page_label = page if page is not None else "N/A"
+
         context_blocks.append(
-            f"[Source {i+1} | Section: {chunk.get('section')} | Page: {chunk.get('page')}]\n{chunk['text']}"
+            f"[Source {i+1}. Section: {section}. Page: {page_label}]\n{chunk['text']}"
         )
 
     return "\n\n".join(context_blocks)
@@ -123,6 +127,10 @@ def dedupe_chunks(chunks):
         unique_chunks.append(chunk)
 
     return unique_chunks
+
+
+def _build_doc_sources(doc_ids):
+    return [{"doc_id": doc_id} for doc_id in doc_ids if doc_id]
 
 
 def generate_answer(query, *args, user_id=None, app_name="default", doc_id=None, llm_config=None):
@@ -160,7 +168,28 @@ def generate_answer(query, *args, user_id=None, app_name="default", doc_id=None,
     if not resolved_user_id:
         raise ValueError("user_id is required")
 
-    chunks = retrieve(query, user_id=resolved_user_id, doc_id=resolved_doc_id)
+    retrieval_result = retrieve(
+        query,
+        user_id=resolved_user_id,
+        doc_id=resolved_doc_id,
+        return_meta=True,
+    )
+
+    if isinstance(retrieval_result, dict):
+        chunks = retrieval_result.get("chunks", [])
+        clarification = retrieval_result.get("clarification")
+        doc_ids = retrieval_result.get("doc_ids", [])
+    else:
+        chunks = retrieval_result
+        clarification = None
+        doc_ids = []
+
+    if clarification:
+        return {
+            "answer": clarification,
+            "sources": _build_doc_sources(doc_ids),
+        }
+
     chunks = dedupe_chunks(chunks)
 
     context = build_context(chunks)
