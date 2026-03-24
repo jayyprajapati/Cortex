@@ -12,6 +12,7 @@ from app.usage.tracker import get_usage, increment_docs, increment_queries
 from app.llm.factory import get_llm
 from app.pipeline.generate_pipeline import generate_answer, resolve_llm_config
 from app.pipeline.ingest_pipeline import ingest_document, ingest_text
+from app.vectorstore.qdrant_store import delete_document_vectors, delete_user_vectors
 
 app = FastAPI(title="Cortex RAG Engine")
 
@@ -66,6 +67,15 @@ class IngestRequest(BaseModel):
 class GenerateRequest(BaseModel):
     prompt: str
     model: Optional[str] = None
+
+
+class DeleteRequest(BaseModel):
+    user_id: str
+    doc_id: str
+
+
+class DeleteAllRequest(BaseModel):
+    user_id: str
 
 
 def _has_user_api_key(llm_options: Optional[LLMOptions]) -> bool:
@@ -277,3 +287,49 @@ def generate_only_endpoint(payload: GenerateRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return {"answer": answer}
+
+
+@app.post("/delete")
+def delete_document_endpoint(payload: DeleteRequest):
+    try:
+        deleted_points = delete_document_vectors(
+            user_id=payload.user_id,
+            doc_id=payload.doc_id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if "No matching vectors found" in detail:
+            raise HTTPException(status_code=404, detail=detail) from exc
+
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return {
+        "status": "ok",
+        "deleted_points": deleted_points,
+        "user_id": payload.user_id,
+        "doc_id": payload.doc_id,
+    }
+
+
+@app.post("/delete_all")
+def delete_all_documents_endpoint(payload: DeleteAllRequest):
+    try:
+        deleted_points = delete_user_vectors(
+            user_id=payload.user_id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if "No matching vectors found" in detail:
+            raise HTTPException(status_code=404, detail=detail) from exc
+
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return {
+        "status": "ok",
+        "deleted_points": deleted_points,
+        "user_id": payload.user_id,
+    }
