@@ -1,8 +1,15 @@
 import uuid
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PayloadSchemaType,
+    VectorParams,
+)
+from app.config import COLLECTION_NAME, VECTOR_SIZE, get_qdrant_client
 
-client = QdrantClient("localhost", port=6333)
+client = get_qdrant_client()
 
 # This function creates a collection in the Qdrant vector database with the name "documents". 
 # The collection is configured to store vector embeddings of size 384 and uses cosine distance for similarity search. 
@@ -10,11 +17,23 @@ client = QdrantClient("localhost", port=6333)
 def create_collection():
 
     client.recreate_collection(
-        collection_name="documents",
+        collection_name=COLLECTION_NAME,
         vectors_config=VectorParams(
-            size=384,
+            size=VECTOR_SIZE,
             distance=Distance.COSINE
         )
+    )
+
+    # Ensure filtered lookups remain fast and valid across Qdrant deployments.
+    client.create_payload_index(
+        collection_name=COLLECTION_NAME,
+        field_name="user_id",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
+    client.create_payload_index(
+        collection_name=COLLECTION_NAME,
+        field_name="doc_id",
+        field_schema=PayloadSchemaType.KEYWORD,
     )
 
 # This function takes a list of Chunk objects and their corresponding embeddings, and stores them in the Qdrant collection. 
@@ -52,11 +71,11 @@ def store_chunks(chunks, embeddings, user_id):
         )
 
     client.upsert(
-        collection_name="documents",
+        collection_name=COLLECTION_NAME,
         points=points
     )
 
-def get_collection_size(collection_name="documents"):
+def get_collection_size(collection_name=COLLECTION_NAME):
     info = client.get_collection(collection_name)
     return info.points_count
 
@@ -90,7 +109,7 @@ def _build_delete_filter(user_id, doc_id=None):
 
 def _delete_by_filter(delete_filter):
     before_count = client.count(
-        collection_name="documents",
+        collection_name=COLLECTION_NAME,
         count_filter=delete_filter,
         exact=True,
     ).count
@@ -99,13 +118,13 @@ def _delete_by_filter(delete_filter):
         raise ValueError("No matching vectors found to delete")
 
     client.delete(
-        collection_name="documents",
+        collection_name=COLLECTION_NAME,
         points_selector=delete_filter,
         wait=True,
     )
 
     after_count = client.count(
-        collection_name="documents",
+        collection_name=COLLECTION_NAME,
         count_filter=delete_filter,
         exact=True,
     ).count

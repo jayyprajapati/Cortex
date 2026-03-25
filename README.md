@@ -37,7 +37,7 @@ Cortex is a standalone RAG + LLM backend service that you can plug into any pers
 ## Prerequisites
 
 - Python 3.11+
-- Qdrant running on `localhost:6333`
+- Qdrant available (local instance or Qdrant Cloud)
 - Optional: local Ollama server for local generation
 
 ### Start Qdrant (example with Docker)
@@ -83,6 +83,24 @@ Create a `.env` file in the project root.
 
 - `EMBEDDING_MODEL` (default: `BAAI/bge-small-en`)
 - `VECTOR_SIZE` (default: `384`)
+
+### Qdrant connection mode
+
+Use only these variables for Qdrant connection:
+
+- `QDRANT_MODE`: `local` or `cloud`
+
+If `QDRANT_MODE=cloud`:
+
+- `QDRANT_URL`
+- `QDRANT_API_KEY`
+
+If `QDRANT_MODE=local`:
+
+- `QDRANT_HOST` (example: `localhost`)
+- `QDRANT_PORT` (example: `6333`)
+
+The app validates these at startup and raises a clear configuration error if required values are missing.
 
 ## Run Cortex API
 
@@ -294,7 +312,7 @@ python3 -m scripts.test_generate
 - No results returned in query:
 	- Confirm data was ingested for the same `user_id`
 	- Confirm `doc_id` filter (if provided) matches ingested document id
-	- Verify Qdrant is running on `localhost:6333`
+	- Verify `QDRANT_MODE` is set correctly and required Qdrant env vars are present
 - Provider/key errors:
 	- Verify `LLM_PROVIDER`, `ALLOW_DEFAULT_LLM`, and relevant API key env vars
 

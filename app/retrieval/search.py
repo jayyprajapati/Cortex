@@ -1,7 +1,7 @@
-from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
+from app.config import COLLECTION_NAME, get_qdrant_client
 
-client = QdrantClient("localhost", port=6333)
+client = get_qdrant_client()
 
 
 def list_user_document_ids(user_id, max_results=1000):
@@ -24,7 +24,7 @@ def list_user_document_ids(user_id, max_results=1000):
 
     while len(doc_ids) < max_results:
         points, next_offset = client.scroll(
-            collection_name="documents",
+            collection_name=COLLECTION_NAME,
             scroll_filter=query_filter,
             offset=offset,
             limit=100,
@@ -71,7 +71,7 @@ def fetch_document_chunks(user_id, doc_id=None, limit=200):
     query_filter = Filter(must=must_conditions)
 
     points, _ = client.scroll(
-        collection_name="documents",
+        collection_name=COLLECTION_NAME,
         scroll_filter=query_filter,
         limit=limit,
         with_payload=["text", "page", "doc_id", "section"],
@@ -120,7 +120,7 @@ def search_documents(query_vector, user_id, doc_id=None, top_k=5):
     query_filter = Filter(must=must_conditions)
 
     response = client.query_points(
-        collection_name="documents",
+        collection_name=COLLECTION_NAME,
         query=query_vector,
         limit=top_k,
         query_filter=query_filter
