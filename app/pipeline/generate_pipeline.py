@@ -126,7 +126,37 @@ def dedupe_chunks(chunks):
 
 
 def _build_doc_sources(doc_ids):
-    return [{"doc_id": doc_id} for doc_id in doc_ids if doc_id]
+    # Avoid exposing internal document identifiers in end-user source payloads.
+    return []
+
+
+def _build_public_sources(chunks):
+    sources = []
+
+    for chunk in chunks:
+        section = str(chunk.get("section") or "Untitled").strip()
+        page = chunk.get("page")
+        page_label = page if page is not None else "N/A"
+
+        source_item = {
+            "section": section,
+            "page": page,
+            "source": f"{section}. Page {page_label}",
+        }
+
+        text = str(chunk.get("text") or "").strip()
+        if text:
+            source_item["text"] = text
+
+        if "score" in chunk:
+            source_item["score"] = chunk["score"]
+
+        if "rerank_score" in chunk:
+            source_item["rerank_score"] = chunk["rerank_score"]
+
+        sources.append(source_item)
+
+    return sources
 
 
 def generate_answer(query, *args, user_id=None, app_name="default", doc_id=None, llm_config=None):
@@ -203,5 +233,5 @@ def generate_answer(query, *args, user_id=None, app_name="default", doc_id=None,
 
     return {
         "answer": answer,
-        "sources": chunks,
+        "sources": _build_public_sources(chunks),
     }
