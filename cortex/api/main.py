@@ -1,264 +1,287 @@
+from __future__ import annotations
+
 import os
 import tempfile
-from typing import Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
-from app.llm.factory import get_llm
-from app.pipeline.generate_pipeline import generate_answer, resolve_llm_config
+from app.api.applications import router as applications_router
+from app.api.collections import router as collections_router
+from app.pipeline.generate_pipeline import generate_answer, generate_direct
 from app.pipeline.ingest_pipeline import ingest_document, ingest_text, resolve_doc_id
+from app.registry.service import build_execution_context
 from app.vectorstore.qdrant_store import delete_document_vectors, delete_user_vectors
 
-app = FastAPI(title="Cortex RAG Engine")
+app = FastAPI(
+    title="Cortex RAG Engine",
+    description="Registry-driven multi-application RAG orchestration",
+    version="2.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-def _sanitize_value(value):
+def _sanitize(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray, memoryview)):
         return f"<binary:{len(value)} bytes>"
-
     if isinstance(value, dict):
-        return {key: _sanitize_value(inner) for key, inner in value.items()}
-
+        return {k: _sanitize(v) for k, v in value.items()}
     if isinstance(value, list):
-        return [_sanitize_value(inner) for inner in value]
-
+        return [_sanitize(v) for v in value]
     if isinstance(value, tuple):
-        return tuple(_sanitize_value(inner) for inner in value)
-
+        return tuple(_sanitize(v) for v in value)
     return value
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(_request: Request, exc: RequestValidationError):
-    # FastAPI's default encoder can crash if invalid requests include raw binary payloads.
-    return JSONResponse(
-        status_code=422,
-        content={"detail": _sanitize_value(exc.errors())},
-    )
+async def _validation_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"detail": _sanitize(exc.errors())})
 
+
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
 
 class LLMOptions(BaseModel):
-    provider: Literal["openai", "ollama"] = "ollama"
+    provider: Literal["openai", "ollama_local", "ollama_cloud", "ollama"] = "ollama_cloud"
     api_key: Optional[str] = None
     model: Optional[str] = None
 
 
 class QueryRequest(BaseModel):
-    query: str
+    app_name: str
     user_id: str
-    app_name: str = "default"
-    doc_id: Optional[str] = None
+    query: str
+    task: Optional[str] = None
+    doc_ids: Optional[List[str]] = None
     llm: Optional[LLMOptions] = None
+    prompt_override: Optional[str] = None
 
 
 class IngestRequest(BaseModel):
+    app_name: str
     user_id: str
     doc_id: Optional[str] = None
     file_path: Optional[str] = None
     text: Optional[str] = None
-    llm: Optional[LLMOptions] = None
 
 
 class GenerateRequest(BaseModel):
-    prompt: str
-    model: Optional[str] = None
+    app_name: str
+    user_id: str
+    query: Optional[str] = None
+    task: Optional[str] = None
+    context: Optional[str] = None
+    input: Optional[Any] = None
+    llm: Optional[LLMOptions] = None
+    prompt_override: Optional[str] = None
 
 
 class DeleteRequest(BaseModel):
+    app_name: str
     user_id: str
     doc_id: str
 
 
 class DeleteAllRequest(BaseModel):
+    app_name: str
     user_id: str
 
 
-def _to_llm_config(llm_options: Optional[LLMOptions]):
-    if not llm_options:
-        return None
+# ---------------------------------------------------------------------------
+# Routers
+# ---------------------------------------------------------------------------
 
-    config = {
-        "provider": llm_options.provider,
-    }
-
-    api_key = (llm_options.api_key or "").strip()
-    if api_key:
-        config["api_key"] = api_key
-
-    if llm_options.model:
-        config["model"] = llm_options.model
-
-    return config
+app.include_router(applications_router)
+app.include_router(collections_router)
 
 
-def _build_llm_options(provider=None, api_key=None, model=None):
-    if provider is None and api_key is None and model is None:
-        return None
-
-    normalized_provider = (provider or "ollama").strip().lower()
-
-    try:
-        return LLMOptions(
-            provider=normalized_provider,
-            api_key=api_key,
-            model=model,
-        )
-    except ValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 @app.get("/")
 def root():
-    return {"message": "RAG engine running"}
-
-
-@app.post("/query")
-def query_endpoint(payload: QueryRequest):
-    try:
-        return generate_answer(
-            query=payload.query,
-            user_id=payload.user_id,
-            app_name=payload.app_name,
-            doc_id=payload.doc_id,
-            llm_config=_to_llm_config(payload.llm),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"message": "Cortex RAG Engine v2.0 — registry-driven"}
 
 
 @app.post("/ingest")
 async def ingest_endpoint(request: Request):
     content_type = (request.headers.get("content-type") or "").lower()
-
     uploaded_file = None
 
     if "application/json" in content_type:
         try:
             body = await request.json()
             payload = IngestRequest(**body)
-        except ValidationError as exc:
-            raise HTTPException(status_code=422, detail=_sanitize_value(exc.errors())) from exc
+        except (ValidationError, Exception) as exc:
+            raise HTTPException(status_code=422, detail=_sanitize(str(exc))) from exc
+
     elif "multipart/form-data" in content_type:
         try:
             form = await request.form()
         except Exception as exc:
             raise HTTPException(
                 status_code=400,
-                detail="Unable to parse multipart form-data. Ensure python-multipart is installed.",
+                detail="Unable to parse multipart form-data.",
             ) from exc
 
         uploaded_file = form.get("file")
-
-        payload = IngestRequest(
-            user_id=str(form.get("user_id") or "").strip(),
-            doc_id=(str(form.get("doc_id") or "").strip() or None),
-            file_path=(str(form.get("file_path") or "").strip() or None),
-            text=(str(form.get("text") or "").strip() or None),
-            llm=_build_llm_options(
-                provider=form.get("llm_provider"),
-                api_key=form.get("llm_api_key"),
-                model=form.get("llm_model"),
-            ),
-        )
+        try:
+            payload = IngestRequest(
+                app_name=str(form.get("app_name") or "").strip(),
+                user_id=str(form.get("user_id") or "").strip(),
+                doc_id=(str(form.get("doc_id") or "").strip() or None),
+                file_path=(str(form.get("file_path") or "").strip() or None),
+                text=(str(form.get("text") or "").strip() or None),
+            )
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=_sanitize(exc.errors())) from exc
     else:
         raise HTTPException(
             status_code=415,
-            detail="Unsupported content-type. Use application/json or multipart/form-data.",
+            detail="Unsupported Content-Type. Use application/json or multipart/form-data.",
         )
 
-    has_path_file = bool(payload.file_path)
-    has_uploaded_file = uploaded_file is not None and hasattr(uploaded_file, "read")
+    has_path = bool(payload.file_path)
+    has_upload = uploaded_file is not None and hasattr(uploaded_file, "read")
     has_text = bool(payload.text)
+    sources = sum([has_path, has_upload, has_text])
 
-    if (1 if has_path_file else 0) + (1 if has_uploaded_file else 0) + (1 if has_text else 0) != 1:
+    if sources != 1:
         raise HTTPException(
             status_code=400,
-            detail="Provide exactly one of file_path, file, or text",
+            detail="Provide exactly one of: file_path, file (upload), or text.",
         )
 
+    try:
+        ctx = build_execution_context(
+            app_name=payload.app_name,
+            user_id=payload.user_id,
+        )
+    except HTTPException:
+        raise
+
+    doc_id = resolve_doc_id(payload.doc_id)
     temp_path = None
-    generated_doc_id = resolve_doc_id(payload.doc_id)
 
     try:
-        if has_uploaded_file:
+        if has_upload:
             file_bytes = await uploaded_file.read()
             if not file_bytes:
-                raise HTTPException(status_code=400, detail="Uploaded file is empty")
-
+                raise HTTPException(status_code=400, detail="Uploaded file is empty.")
             suffix = os.path.splitext(uploaded_file.filename or "")[1]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-                temp_file.write(file_bytes)
-                temp_path = temp_file.name
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(file_bytes)
+                temp_path = tmp.name
+            result = ingest_document(ctx, temp_path, doc_id)
 
-            ingest_document(
-                path=temp_path,
-                doc_id=generated_doc_id,
-                user_id=payload.user_id,
-                api_key=(payload.llm.api_key if payload.llm else None),
-            )
-        elif has_path_file:
-            ingest_document(
-                path=payload.file_path,
-                doc_id=generated_doc_id,
-                user_id=payload.user_id,
-                api_key=(payload.llm.api_key if payload.llm else None),
-            )
+        elif has_path:
+            result = ingest_document(ctx, payload.file_path, doc_id)
+
         else:
-            ingest_text(
-                text=payload.text,
-                doc_id=generated_doc_id,
-                user_id=payload.user_id,
-            )
+            result = ingest_text(ctx, payload.text, doc_id)
+
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
 
-    return {
-        "status": "success",
-        "doc_id": generated_doc_id,
-    }
+    return {"status": "success", **result}
+
+
+@app.post("/query")
+def query_endpoint(payload: QueryRequest):
+    try:
+        llm_override = None
+        if payload.llm:
+            llm_override = {
+                "provider": payload.llm.provider,
+                "model": payload.llm.model,
+                "api_key": payload.llm.api_key,
+            }
+
+        ctx = build_execution_context(
+            app_name=payload.app_name,
+            user_id=payload.user_id,
+            task=payload.task,
+            doc_ids=payload.doc_ids,
+            llm_override=llm_override,
+            prompt_override=payload.prompt_override,
+        )
+        return generate_answer(ctx, payload.query)
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/generate")
 def generate_only_endpoint(payload: GenerateRequest):
     try:
-        llm_config = dict(resolve_llm_config())
+        llm_override = None
+        if payload.llm:
+            llm_override = {
+                "provider": payload.llm.provider,
+                "model": payload.llm.model,
+                "api_key": payload.llm.api_key,
+            }
 
-        if payload.model:
-            llm_config["model"] = payload.model
+        composed_context = ""
+        if payload.context:
+            composed_context += str(payload.context).strip()
+        if payload.input is not None:
+            if composed_context:
+                composed_context += "\n\n"
+            composed_context += f"Task input:\n{_sanitize(payload.input)}"
 
-        llm = get_llm(llm_config)
-        answer = llm.generate(payload.prompt)
+        ctx = build_execution_context(
+            app_name=payload.app_name,
+            user_id=payload.user_id,
+            task=payload.task,
+            llm_override=llm_override,
+            prompt_override=payload.prompt_override,
+        )
+        return generate_direct(ctx, query=payload.query or "", context=composed_context)
+
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    return {"answer": answer}
 
 
 @app.post("/delete")
 def delete_document_endpoint(payload: DeleteRequest):
     try:
-        deleted_points = delete_document_vectors(
-            user_id=payload.user_id,
-            doc_id=payload.doc_id,
-        )
+        ctx = build_execution_context(app_name=payload.app_name, user_id=payload.user_id)
+        deleted = delete_document_vectors(ctx.collection, payload.user_id, payload.doc_id)
+    except HTTPException:
+        raise
     except ValueError as exc:
         detail = str(exc)
-        if "No matching vectors found" in detail:
-            raise HTTPException(status_code=404, detail=detail) from exc
-
-        raise HTTPException(status_code=400, detail=detail) from exc
+        status = 404 if "No matching vectors" in detail else 400
+        raise HTTPException(status_code=status, detail=detail) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return {
         "status": "ok",
-        "deleted_points": deleted_points,
+        "deleted_points": deleted,
+        "app_name": payload.app_name,
         "user_id": payload.user_id,
         "doc_id": payload.doc_id,
     }
@@ -267,20 +290,20 @@ def delete_document_endpoint(payload: DeleteRequest):
 @app.post("/delete_all")
 def delete_all_documents_endpoint(payload: DeleteAllRequest):
     try:
-        deleted_points = delete_user_vectors(
-            user_id=payload.user_id,
-        )
+        ctx = build_execution_context(app_name=payload.app_name, user_id=payload.user_id)
+        deleted = delete_user_vectors(ctx.collection, payload.user_id)
+    except HTTPException:
+        raise
     except ValueError as exc:
         detail = str(exc)
-        if "No matching vectors found" in detail:
-            raise HTTPException(status_code=404, detail=detail) from exc
-
-        raise HTTPException(status_code=400, detail=detail) from exc
+        status = 404 if "No matching vectors" in detail else 400
+        raise HTTPException(status_code=status, detail=detail) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return {
         "status": "ok",
-        "deleted_points": deleted_points,
+        "deleted_points": deleted,
+        "app_name": payload.app_name,
         "user_id": payload.user_id,
     }

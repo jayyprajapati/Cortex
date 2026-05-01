@@ -1,12 +1,13 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
-# This module defines the data structure for a text chunk extracted from a document. 
-# Each chunk contains metadata about the text content, the document ID it belongs to, the page number, and a unique chunk ID. 
-# This structure is used to organize and manage the chunks of text that will be embedded and stored in a vector database for retrieval during question-answering tasks.
+
+
 @dataclass
 class Chunk:
     text: str
     doc_id: str
-    page: int
+    page: Optional[int]
     chunk_id: int
     section: Optional[str] = None
+    hierarchy: Optional[str] = None
+    token_count: Optional[int] = None

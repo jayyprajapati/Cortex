@@ -1,16 +1,67 @@
-# This module is responsible for generating vector embeddings from text chunks using a pre-trained sentence transformer model. 
-# The embed_chunks function takes a list of Chunk objects, extracts the text from each chunk, and uses the SentenceTransformer model to encode the texts into vector representations. 
-# These vectors can then be stored in a vector database for efficient retrieval during question-answering tasks. 
-# The use of a pre-trained model like "BAAI/bge-small-en" allows for high-quality embeddings that capture the semantic meaning of the text, improving the performance of the retrieval system when matching user queries to relevant chunks of information. 
-# This module is a crucial part of the pipeline that transforms raw text data into a format that can be effectively used for similarity search and retrieval in a RAG (Retrieval-Augmented Generation) system.
+from __future__ import annotations
+
+import logging
+import time
+from typing import List, Optional
+
 from sentence_transformers import SentenceTransformer
 
-model = SentenceTransformer("BAAI/bge-small-en")
+from app.chunking.models import Chunk
+from app.registry.models import EmbeddingConfig
 
-def embed_chunks(chunks):
+logger = logging.getLogger(__name__)
 
+_model_cache: dict[str, SentenceTransformer] = {}
+
+
+def _get_model(model_name: str) -> SentenceTransformer:
+    if model_name not in _model_cache:
+        logger.info("Loading embedding model: %s", model_name)
+        _model_cache[model_name] = SentenceTransformer(model_name)
+    return _model_cache[model_name]
+
+
+def get_embedding_dimension(model_name: str) -> int:
+    model = _get_model(model_name)
+    dim = model.get_sentence_embedding_dimension()
+    if dim is None:
+        raise ValueError(f"Cannot determine embedding dimension for model: {model_name!r}")
+    return int(dim)
+
+
+def embed_chunks(chunks: List[Chunk], config: EmbeddingConfig) -> List:
+    if not chunks:
+        return []
+
+    model = _get_model(config.model)
     texts = ["passage: " + c.text for c in chunks]
+    t0 = time.monotonic()
 
-    vectors = model.encode(texts)
+    all_vectors: List = []
+    for i in range(0, len(texts), config.batch_size):
+        batch = texts[i : i + config.batch_size]
+        vectors = model.encode(batch, normalize_embeddings=config.normalize, show_progress_bar=False)
+        all_vectors.extend(vectors)
 
-    return vectors
+    latency_ms = (time.monotonic() - t0) * 1000
+    logger.info(
+        "embed_chunks model=%s count=%d latency_ms=%.1f",
+        config.model,
+        len(chunks),
+        latency_ms,
+    )
+
+    return all_vectors
+
+
+def embed_query(query: str, config: EmbeddingConfig) -> list:
+    model = _get_model(config.model)
+    t0 = time.monotonic()
+    vector = model.encode(
+        "query: " + query,
+        normalize_embeddings=config.normalize,
+        show_progress_bar=False,
+    )
+    latency_ms = (time.monotonic() - t0) * 1000
+    logger.info("embed_query model=%s latency_ms=%.1f", config.model, latency_ms)
+    return vector

@@ -1,0 +1,146 @@
+{
+  "doclens": {
+    "collection": "doclens",
+    "ingestion": {
+      "strategy": "semantic_doc",
+      "max_tokens": 512,
+      "min_tokens": 50,
+      "overlap_tokens": 64,
+      "semantic_split": true
+    },
+    "embedding": {
+      "model": "BAAI/bge-small-en",
+      "batch_size": 32,
+      "normalize": true
+    },
+    "retrieval": {
+      "top_k": 10,
+      "hybrid": true,
+      "alpha": 0.7
+    },
+    "reranking": {
+      "enabled": true,
+      "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+      "top_k": 5,
+      "candidate_cap": 20
+    },
+    "generation": {
+      "response_type": "markdown",
+      "temperature": 0.1,
+      "strict": false,
+      "max_retries": 2
+    },
+    "defaults": {
+      "system_prompt": "You are DocLens, a document intelligence assistant. Answer only from the retrieved context. Format your response in clear markdown. If the answer is not present in the context, say so explicitly."
+    }
+  },
+  "cvscan": {
+    "collection": "cvscan",
+    "ingestion": {
+      "strategy": "resume_structured",
+      "max_tokens": 256,
+      "min_tokens": 30,
+      "overlap_tokens": 0,
+      "semantic_split": false
+    },
+    "embedding": {
+      "model": "BAAI/bge-small-en",
+      "batch_size": 32,
+      "normalize": true
+    },
+    "retrieval": {
+      "top_k": 15,
+      "hybrid": true,
+      "alpha": 0.6
+    },
+    "reranking": {
+      "enabled": true,
+      "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+      "top_k": 8,
+      "candidate_cap": 30
+    },
+    "generation": {
+      "response_type": "json",
+      "temperature": 0.05,
+      "strict": true,
+      "max_retries": 3
+    },
+    "defaults": {
+      "system_prompt": "You are CVScan, a professional resume analysis assistant. Analyze the provided context and return ONLY valid JSON matching the required schema."
+    },
+    "default_task": "resume_match",
+    "tasks": {
+      "resume_match": {
+        "system_prompt": "You are CVScan. Analyze the resume against the job description and return ONLY valid JSON. Always include every required field. Use empty string for missing strings, [] for missing arrays, 0 for missing numbers.",
+        "response_type": "json",
+        "schema": {
+          "type": "object",
+          "required": ["candidate_name", "score", "strengths", "weaknesses", "missing_keywords", "summary"],
+          "properties": {
+            "candidate_name": {"type": "string"},
+            "score": {"type": "number"},
+            "strengths": {"type": "array", "items": {"type": "string"}},
+            "weaknesses": {"type": "array", "items": {"type": "string"}},
+            "missing_keywords": {"type": "array", "items": {"type": "string"}},
+            "summary": {"type": "string"}
+          }
+        },
+        "strict": true
+      },
+      "resume_extract": {
+        "system_prompt": "You are CVScan. Extract all resume details from the context and return ONLY valid JSON.",
+        "response_type": "json",
+        "schema": {
+          "type": "object",
+          "required": ["candidate_name", "contact", "summary", "skills", "experience", "education", "certifications", "projects"],
+          "properties": {
+            "candidate_name": {"type": "string"},
+            "contact": {"type": "object"},
+            "summary": {"type": "string"},
+            "skills": {"type": "array", "items": {"type": "string"}},
+            "experience": {"type": "array"},
+            "education": {"type": "array"},
+            "certifications": {"type": "array", "items": {"type": "string"}},
+            "projects": {"type": "array"}
+          }
+        },
+        "strict": true
+      },
+      "gap_analysis": {
+        "system_prompt": "You are CVScan. Perform a detailed gap analysis between the resume and job requirements and return ONLY valid JSON.",
+        "response_type": "json",
+        "schema": {
+          "type": "object",
+          "required": ["matching_skills", "missing_skills", "strengths", "gaps", "recommendations", "confidence"],
+          "properties": {
+            "matching_skills": {"type": "array", "items": {"type": "string"}},
+            "missing_skills": {"type": "array", "items": {"type": "string"}},
+            "strengths": {"type": "array", "items": {"type": "string"}},
+            "gaps": {"type": "array", "items": {"type": "string"}},
+            "recommendations": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "number"}
+          }
+        },
+        "strict": true
+      },
+      "resume_generate_structured": {
+        "system_prompt": "You are CVScan. Generate an optimized structured resume output from the provided context and return ONLY valid JSON.",
+        "response_type": "json",
+        "schema": {
+          "type": "object",
+          "required": ["headline", "summary", "skills", "experience_bullets", "education", "certifications", "projects"],
+          "properties": {
+            "headline": {"type": "string"},
+            "summary": {"type": "string"},
+            "skills": {"type": "array", "items": {"type": "string"}},
+            "experience_bullets": {"type": "array", "items": {"type": "string"}},
+            "education": {"type": "array"},
+            "certifications": {"type": "array", "items": {"type": "string"}},
+            "projects": {"type": "array"}
+          }
+        },
+        "strict": true
+      }
+    }
+  }
+}

@@ -88,3 +88,66 @@ temp/
 # Logs
 logs/
 *.log
+
+# ======================
+# Python / FastAPI
+# ======================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.env/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Pytest / coverage
+.coverage
+.pytest_cache/
+htmlcov/
+nosetests.xml
+coverage.xml
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# ======================
+# Node / React (frontend folder)
+# ======================
+# Node modules
+/frontend/node_modules/
+
+# Build output
+/frontend/build/
+/frontend/dist/
+
+# Environment variables
+/frontend/.env
+
+# npm debug files
+/frontend/npm-debug.log*
+/frontend/yarn-debug.log*
+/frontend/yarn-error.log*
+
+# Lock files (optional, depending on preference)
+# /frontend/package-lock.json
+# /frontend/yarn.lock
+
+# ======================
+# Misc / OS
+# ======================
+.DS_Store
+Thumbs.db
+
+.claude
