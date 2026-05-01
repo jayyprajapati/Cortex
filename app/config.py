@@ -1,24 +1,21 @@
-from dotenv import load_dotenv
-import os
+from __future__ import annotations
+
 import logging
+import os
 from functools import lru_cache
 
+from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-OLLAMA_CLOUD_API_KEY = os.getenv("OLLAMA_CLOUD_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama_cloud")
-LLM_MODEL = os.getenv("LLM_MODEL")
-
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en")
-VECTOR_SIZE = int(os.getenv("VECTOR_SIZE", 384))
-
-COLLECTION_NAME = "documents"
+# LLM configuration — resolved at runtime by registry/service.py
+OLLAMA_CLOUD_API_KEY: str | None = os.getenv("OLLAMA_CLOUD_API_KEY")
+OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY")
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "ollama_cloud")
+LLM_MODEL: str | None = os.getenv("LLM_MODEL")
 
 
 def _require_env(name: str) -> str:
@@ -28,9 +25,9 @@ def _require_env(name: str) -> str:
     return value
 
 
-def _parse_qdrant_port(port_value: str) -> int:
+def _parse_port(raw: str) -> int:
     try:
-        return int(port_value)
+        return int(raw)
     except (TypeError, ValueError) as exc:
         raise ValueError("QDRANT_PORT must be a valid integer") from exc
 
@@ -40,19 +37,15 @@ def get_qdrant_client() -> QdrantClient:
     mode = str(os.getenv("QDRANT_MODE") or "").strip().lower()
 
     if mode not in {"cloud", "local"}:
-        raise ValueError(
-            "QDRANT_MODE must be set to either 'cloud' or 'local'"
-        )
+        raise ValueError("QDRANT_MODE must be set to 'cloud' or 'local'")
 
     if mode == "cloud":
         url = _require_env("QDRANT_URL")
         api_key = _require_env("QDRANT_API_KEY")
-        logger.info("Using Qdrant mode: cloud")
-        logger.info("Qdrant endpoint: %s", url)
+        logger.info("Qdrant mode=cloud endpoint=%s", url)
         return QdrantClient(url=url, api_key=api_key)
 
     host = _require_env("QDRANT_HOST")
-    port = _parse_qdrant_port(_require_env("QDRANT_PORT"))
-    logger.info("Using Qdrant mode: local")
-    logger.info("Qdrant endpoint: %s:%s", host, port)
+    port = _parse_port(_require_env("QDRANT_PORT"))
+    logger.info("Qdrant mode=local endpoint=%s:%s", host, port)
     return QdrantClient(host=host, port=port)

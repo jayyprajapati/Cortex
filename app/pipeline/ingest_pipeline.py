@@ -1,49 +1,95 @@
+from __future__ import annotations
+
+import logging
+import time
 import uuid
 
-from app.ingestion.loader import load_document
 from app.chunking.chunker import create_chunks
-from app.embeddings.embedder import embed_chunks
-from app.vectorstore.qdrant_store import store_chunks
+from app.context import ExecutionContext
+from app.embeddings.embedder import embed_chunks, get_embedding_dimension
+from app.ingestion.loader import load_document
+from app.observability.logger import cortex_logger
+from app.vectorstore.qdrant_store import ensure_collection, store_chunks
 
-# This module defines the main function for the ingestion pipeline, which orchestrates the entire process of loading a document, creating text chunks, generating embeddings, and storing them in a vector database.
-# The ingest_document function takes the file path and document ID as input, and performs the following steps:
-# 1. Loads the document using the load_document function, which extracts text elements from the file.
-# 2. Creates text chunks from the extracted elements using the create_chunks function, which organizes the text into manageable pieces based on a token limit.
-# 3. Generates vector embeddings for the created chunks using the embed_chunks function, which utilizes a pre-trained sentence transformer model to encode the text into vector representations.
-# 4. Stores the chunks and their corresponding embeddings in a Qdrant vector database using the store_chunks function, which upserts the data into a collection for efficient retrieval during question-answering tasks.
-# This function is a critical part of the pipeline that ensures the processed and embedded chunks of text are stored in a way that facilitates fast and accurate retrieval when users query the system.
-def resolve_doc_id(doc_id):
-    normalized_doc_id = str(doc_id).strip() if doc_id is not None else ""
-    if normalized_doc_id:
-        return normalized_doc_id
-
-    return str(uuid.uuid4())
+logger = logging.getLogger(__name__)
 
 
-def _ingest_elements(elements, doc_id, user_id):
-
-    resolved_doc_id = resolve_doc_id(doc_id)
-
-    chunks = create_chunks(elements, resolved_doc_id)
-
-    embeddings = embed_chunks(chunks)
-    print(f"Prepared {len(chunks)} chunks for doc_id={resolved_doc_id}")
-    store_chunks(chunks, embeddings, user_id)
-
-    return chunks
+def resolve_doc_id(doc_id) -> str:
+    normalized = str(doc_id).strip() if doc_id is not None else ""
+    return normalized or str(uuid.uuid4())
 
 
-def ingest_document(path, doc_id, user_id, api_key=None):
-
+def ingest_document(ctx: ExecutionContext, path: str, doc_id: str) -> dict:
     elements = load_document(path)
+    return _ingest_elements(ctx, elements, doc_id)
 
-    return _ingest_elements(elements, doc_id, user_id)
 
-
-def ingest_text(text, doc_id, user_id):
+def ingest_text(ctx: ExecutionContext, text: str, doc_id: str) -> dict:
     cleaned = str(text).strip() if text is not None else ""
     if not cleaned:
         raise ValueError("text is required for raw text ingestion")
+    return _ingest_elements(ctx, [{"text": cleaned, "page": 1}], doc_id)
 
-    elements = [{"text": cleaned, "page": 1}]
-    return _ingest_elements(elements, doc_id, user_id)
+
+def _ingest_elements(ctx: ExecutionContext, elements: list, doc_id: str) -> dict:
+    ingestion_cfg = ctx.registry.ingestion
+    embedding_cfg = ctx.registry.embedding
+    collection = ctx.collection
+    user_id = ctx.user_id
+    t0 = time.monotonic()
+
+    # --- Chunk ---
+    t_chunk = time.monotonic()
+    chunks = create_chunks(elements, doc_id, ingestion_cfg)
+    chunk_ms = (time.monotonic() - t_chunk) * 1000
+
+    if not chunks:
+        raise ValueError(
+            f"No chunks produced for doc_id={doc_id!r}. "
+            "The document may be empty or unparseable with the configured strategy."
+        )
+
+    # --- Resolve embedding dimension and ensure collection ---
+    dim = embedding_cfg.dimension or get_embedding_dimension(embedding_cfg.model)
+    ensure_collection(collection, dim)
+
+    # --- Embed ---
+    t_embed = time.monotonic()
+    embeddings = embed_chunks(chunks, embedding_cfg)
+    embed_ms = (time.monotonic() - t_embed) * 1000
+
+    # --- Store ---
+    t_store = time.monotonic()
+    store_chunks(chunks, embeddings, user_id, collection)
+    store_ms = (time.monotonic() - t_store) * 1000
+
+    total_ms = (time.monotonic() - t0) * 1000
+
+    cortex_logger.log_ingest(
+        app_name=ctx.app_name,
+        doc_id=doc_id,
+        user_id=user_id,
+        strategy=ingestion_cfg.strategy,
+        chunk_count=len(chunks),
+        embed_model=embedding_cfg.model,
+        collection=collection,
+        chunk_latency_ms=chunk_ms,
+        embed_latency_ms=embed_ms,
+        store_latency_ms=store_ms,
+        total_latency_ms=total_ms,
+    )
+
+    logger.info(
+        "ingest complete doc_id=%s chunks=%d collection=%s total_ms=%.1f",
+        doc_id,
+        len(chunks),
+        collection,
+        total_ms,
+    )
+
+    return {
+        "doc_id": doc_id,
+        "chunk_count": len(chunks),
+        "collection": collection,
+        "app_name": ctx.app_name,
+    }
