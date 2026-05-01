@@ -272,14 +272,17 @@ def generate_answer(ctx: ExecutionContext, query: str) -> dict:
     """
     gen = ctx.effective_generation
 
+    t_retrieve = time.monotonic()
     retrieval_result = retrieve_and_rerank(ctx, query)
+    retrieve_ms = (time.monotonic() - t_retrieve) * 1000
+
     clarification = retrieval_result.get("clarification")
 
     if clarification:
         if gen.response_type == "json":
             context_str = clarification
         else:
-            return {"answer": clarification, "sources": []}
+            return {"answer": clarification, "sources": [], "meta": {"retrieved_count": 0, "reranked_count": 0, "retrieve_ms": 0, "generate_ms": 0}}
 
     chunks = _dedupe_chunks(retrieval_result.get("chunks", []))
     context_str = _build_context_str(chunks)
@@ -288,14 +291,14 @@ def generate_answer(ctx: ExecutionContext, query: str) -> dict:
         if gen.response_type == "json":
             context_str = _NO_CONTEXT
         else:
-            return {"answer": _NO_CONTEXT, "sources": []}
+            return {"answer": _NO_CONTEXT, "sources": [], "meta": {"retrieved_count": 0, "reranked_count": 0, "retrieve_ms": round(retrieve_ms, 1), "generate_ms": 0}}
 
     prompt = _build_prompt(query, context_str, gen)
     llm = get_llm(ctx.llm_config)
 
     t0 = time.monotonic()
     answer = generate_with_output_contract(llm, prompt, gen)
-    total_ms = (time.monotonic() - t0) * 1000
+    generate_ms = (time.monotonic() - t0) * 1000
 
     cortex_logger.log_generate(
         app_name=ctx.app_name,
@@ -303,12 +306,18 @@ def generate_answer(ctx: ExecutionContext, query: str) -> dict:
         response_type=gen.response_type,
         attempt_count=1,
         success=not (isinstance(answer, dict) and answer.get("error") == "generation_failed"),
-        latency_ms=total_ms,
+        latency_ms=generate_ms,
     )
 
     return {
         "answer": answer,
         "sources": _build_public_sources(chunks),
+        "meta": {
+            "retrieved_count": retrieval_result.get("retrieved_count", len(chunks)),
+            "reranked_count": retrieval_result.get("reranked_count", len(chunks)),
+            "retrieve_ms": round(retrieve_ms, 1),
+            "generate_ms": round(generate_ms, 1),
+        },
     }
 
 

@@ -1,36 +1,46 @@
-# Cortex - RAG Engine from Scratch
-## 1) Project Overview
+# Cortex — Registry-Driven RAG Engine
 
-Cortex is a standalone RAG + LLM backend service that you can plug into any personal project as a shared AI core. Instead of rebuilding ingestion, retrieval, and model wiring in every app, Cortex stays independent so each product can integrate with one stable API for knowledge ingestion and grounded generation. This makes it a single source of truth for your personal RAG stack while your other projects stay thin and focused on their own UI or business logic.
+## Overview
 
-Problems Cortex solves:
+Cortex is a standalone RAG + LLM backend service designed to be shared across multiple personal projects as a single AI core. Instead of rebuilding ingestion, retrieval, and LLM wiring in every app, Cortex exposes one stable API that any downstream client (DocLens, resume-align, etc.) can call with its own `app_name`.
 
-- Standardizes ingestion for PDF, DOCX, and Markdown.
-- Provides one vector retrieval backend (Qdrant) for all downstream services.
-- Keeps LLM orchestration and prompt-building in one deployable service.
-- Supports multi-document retrieval with user-level filtering and reranking.
+Every application is registered in a central registry that defines its ingestion strategy, embedding model, retrieval parameters, reranking settings, and generation config. Cortex resolves all of this at runtime per request — no code changes needed to add a new app.
 
-High-level architecture:
+**Version:** 2.0 — registry-driven, multi-application
 
-```text
-Client/API Consumer
-		|
-		v
-FastAPI (cortex.api.main)
-		|-- /ingest  -> parsing -> chunking -> embedding -> Qdrant upsert
-		|-- /query   -> query embedding -> Qdrant search -> rerank -> LLM
-		|-- /generate (optional direct prompt -> LLM)
+```
+Client (DocLens / CVScan / any app)
+        |
+        v
+FastAPI  (cortex/api/main.py)
+        |-- POST /ingest    → parse → chunk → embed → Qdrant upsert
+        |-- POST /query     → embed query → Qdrant hybrid search → rerank → LLM
+        |-- POST /generate  → LLM generation with supplied context
+        |-- GET|POST /apps  → registry CRUD
+        |-- GET|POST /collections → Qdrant collection management
 ```
 
-## 2) Tech Stack
+---
 
-- Python 3.11+
-- FastAPI + Uvicorn
-- Sentence Transformers (default embedding model: BAAI/bge-small-en)
-- Qdrant (Cloud or Local)
-- PyMuPDF and DOCX/Markdown parsers for ingestion
+## Tech Stack
 
-## 3) Environment Setup
+| Component | Package | Version |
+|---|---|---|
+| API framework | FastAPI + Uvicorn | 0.115.0 / 0.30.6 |
+| Data validation | Pydantic | 2.12.5 |
+| Embeddings | sentence-transformers | 2.7.0 |
+| Default embedding model | BAAI/bge-small-en | 384 dims |
+| Vector store | qdrant-client | 1.17.1 |
+| Document parsing | PyMuPDF | 1.24.9 |
+| LLM (OpenAI) | openai | 1.30.1 |
+| LLM (Ollama) | ollama | 0.2.0 |
+| ML / reranking | scikit-learn, torch | 1.8.0 / 2.2.2 |
+| Tokenization | tiktoken, transformers | 0.12.0 / 4.41.2 |
+| Python | — | 3.11+ |
+
+---
+
+## Environment Setup
 
 ```bash
 python3 -m venv .venv
@@ -38,20 +48,15 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Initialize the Qdrant collection and indexes:
+---
 
-```bash
-python3 -m scripts.setup_vector_db
-```
+## Environment Variables
 
-## 4) Environment Variables (.env)
-
-Create a .env file at the project root.
-
-Required Qdrant mode switch:
+Create a `.env` file at the project root.
 
 ```env
-QDRANT_MODE=cloud
+# --- Qdrant (required) ---
+QDRANT_MODE=local          # "cloud" or "local"
 
 # Cloud mode
 QDRANT_URL=https://your-cluster.qdrant.io:6333
@@ -60,59 +65,299 @@ QDRANT_API_KEY=your_qdrant_api_key
 # Local mode
 QDRANT_HOST=localhost
 QDRANT_PORT=6333
-```
 
-How switching works:
-
-- Set QDRANT_MODE=cloud and provide QDRANT_URL + QDRANT_API_KEY.
-- Set QDRANT_MODE=local and provide QDRANT_HOST + QDRANT_PORT.
-- No code changes are required. Cortex validates the required variables at startup and raises a clear error when config is invalid.
-
-Additional runtime config:
-
-```env
-LLM_PROVIDER=ollama_cloud
-LLM_MODEL=
-OLLAMA_CLOUD_API_KEY=
+# --- LLM defaults (used when no llm override is passed per request) ---
+LLM_PROVIDER=ollama_cloud  # openai | ollama_cloud | ollama_local
+LLM_MODEL=                 # leave blank for provider defaults
 OPENAI_API_KEY=
+OLLAMA_CLOUD_API_KEY=
 
-EMBEDDING_MODEL=BAAI/bge-small-en
-VECTOR_SIZE=384
+# --- Optional ---
+CORTEX_APP_REGISTRY_PATH=  # default: app/registry/registry.json
 ```
 
-## 5) Running Locally
+**Qdrant mode rules:**
+- `QDRANT_MODE=cloud` → requires `QDRANT_URL` + `QDRANT_API_KEY`
+- `QDRANT_MODE=local` → requires `QDRANT_HOST` + `QDRANT_PORT`
+- Cortex validates at startup and raises a clear error if config is missing.
 
-Recommended (matches this repository entrypoint):
+**LLM resolution order per request:**
+1. `llm` field in the request body (`provider`, `api_key`, `model`)
+2. Env var defaults (`LLM_PROVIDER` + corresponding key)
+3. Falls back to `ollama_local` if nothing resolves
+
+---
+
+## Running Locally
 
 ```bash
+# From project root
 uvicorn main:app --reload
 ```
 
-Alternative module form:
+Alternative (same result — root `main.py` is a thin re-export):
 
 ```bash
-python3 -m uvicorn cortex.api.main:app --reload
+uvicorn cortex.api.main:app --reload
 ```
 
-Compatibility command (if your deployment path exposes app.api.main):
+API base URL: `http://localhost:8000`
+
+Interactive docs: `http://localhost:8000/docs`
+
+---
+
+## Application Registry
+
+Every client app must be registered before it can use `/ingest`, `/query`, or `/generate`. Registrations are persisted in `app/registry/registry.json`.
+
+**Pre-registered apps (included in repo):**
+- `doclens` — document Q&A (semantic_doc ingestion, markdown generation)
+- `cvscan` — resume analysis (resume_structured ingestion, structured JSON generation)
+
+### Register a new app
 
 ```bash
-uvicorn app.api.main:app --reload
+curl -X POST http://localhost:8000/apps/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "app_name": "myapp",
+    "collection": "myapp",
+    "ingestion": {
+      "strategy": "semantic_doc",
+      "max_tokens": 512,
+      "min_tokens": 50,
+      "overlap_tokens": 64,
+      "semantic_split": true
+    },
+    "embedding": {
+      "model": "BAAI/bge-small-en",
+      "batch_size": 32,
+      "normalize": true
+    },
+    "retrieval": { "top_k": 10, "hybrid": true, "alpha": 0.7 },
+    "reranking": {
+      "enabled": true,
+      "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+      "top_k": 5,
+      "candidate_cap": 20
+    },
+    "generation": {
+      "response_type": "markdown",
+      "temperature": 0.1,
+      "strict": false,
+      "max_retries": 2
+    },
+    "defaults": {
+      "system_prompt": "You are a helpful assistant. Answer only from the provided context."
+    }
+  }'
 ```
 
-API base URL:
+---
 
-```text
-http://localhost:8000
+## API Reference
+
+### Health
+
+```
+GET /
 ```
 
-## 6) Production Deployment (systemd)
+Response:
+```json
+{ "message": "Cortex RAG Engine v2.0 — registry-driven" }
+```
 
-Example service file: /etc/systemd/system/cortex.service
+---
+
+### Ingest
+
+```
+POST /ingest
+```
+
+Accepts `multipart/form-data` (file upload) or `application/json` (file path or raw text). Exactly one content source must be provided.
+
+**Multipart upload:**
+```bash
+curl -X POST http://localhost:8000/ingest \
+  -F "app_name=doclens" \
+  -F "user_id=user_1" \
+  -F "file=@/path/to/document.pdf"
+```
+
+**JSON with file path:**
+```bash
+curl -X POST http://localhost:8000/ingest \
+  -H "Content-Type: application/json" \
+  -d '{"app_name": "doclens", "user_id": "user_1", "file_path": "/path/to/document.pdf"}'
+```
+
+**Response:**
+```json
+{
+  "status": "success",
+  "doc_id": "a1b2c3d4-...",
+  "chunk_count": 18,
+  "collection": "doclens",
+  "app_name": "doclens"
+}
+```
+
+Fields:
+| Field | Type | Required |
+|---|---|---|
+| `app_name` | string | yes — must match a registered app |
+| `user_id` | string | yes |
+| `doc_id` | string | no — auto-generated UUID if omitted |
+| `file` | upload | one of three |
+| `file_path` | string | one of three |
+| `text` | string | one of three |
+
+---
+
+### Query
+
+```
+POST /query
+```
+
+Full RAG pipeline: embed query → hybrid search → rerank → LLM generation.
+
+```bash
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "app_name": "doclens",
+    "user_id": "user_1",
+    "query": "What are the key findings?",
+    "doc_ids": ["a1b2c3d4-..."],
+    "llm": {
+      "provider": "openai",
+      "api_key": "sk-...",
+      "model": "gpt-4o-mini"
+    }
+  }'
+```
+
+**Response:**
+```json
+{
+  "answer": "The key findings include...",
+  "sources": [
+    {
+      "section": "Executive Summary",
+      "page": 2,
+      "text": "...",
+      "score": 0.91,
+      "rerank_score": 3.44
+    }
+  ]
+}
+```
+
+Fields:
+| Field | Type | Required |
+|---|---|---|
+| `app_name` | string | yes |
+| `user_id` | string | yes |
+| `query` | string | yes |
+| `doc_ids` | `List[string]` | no — searches all user docs if omitted |
+| `llm.provider` | `openai` \| `ollama_cloud` \| `ollama_local` | no — falls back to env |
+| `llm.api_key` | string | required when `provider=openai` |
+| `llm.model` | string | no — provider default if omitted |
+| `task` | string | no — named task override from registry |
+| `prompt_override` | string | no — replaces system prompt |
+
+---
+
+### Generate
+
+```
+POST /generate
+```
+
+LLM generation without retrieval. Caller supplies context directly.
+
+```bash
+curl -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "app_name": "doclens",
+    "user_id": "user_1",
+    "query": "Summarize the following text",
+    "context": "The report covers...",
+    "llm": { "provider": "openai", "api_key": "sk-...", "model": "gpt-4o-mini" }
+  }'
+```
+
+**Response:**
+```json
+{ "answer": "..." }
+```
+
+---
+
+### Delete Document
+
+```
+POST /delete
+```
+
+```json
+{ "app_name": "doclens", "user_id": "user_1", "doc_id": "a1b2c3d4-..." }
+```
+
+**Response:**
+```json
+{ "status": "ok", "deleted_points": 18, "app_name": "doclens", "user_id": "user_1", "doc_id": "..." }
+```
+
+---
+
+### Delete All Documents
+
+```
+POST /delete_all
+```
+
+```json
+{ "app_name": "doclens", "user_id": "user_1" }
+```
+
+---
+
+### Application Registry Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/apps` | List all registered app names |
+| `POST` | `/apps/register` | Register a new application |
+| `GET` | `/apps/{app_name}` | Get app config |
+| `PUT` | `/apps/{app_name}` | Update full app config |
+| `DELETE` | `/apps/{app_name}` | Delete app from registry |
+
+---
+
+### Collection Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/collections` | List all Qdrant collections |
+| `POST` | `/collections` | Create a new collection |
+| `GET` | `/collections/{name}` | Get collection info |
+| `DELETE` | `/collections/{name}` | Delete collection |
+
+---
+
+## Production Deployment (systemd)
+
+Create `/etc/systemd/system/cortex.service`:
 
 ```ini
 [Unit]
-Description=Cortex FastAPI RAG Engine
+Description=Cortex RAG Engine v2
 After=network.target
 
 [Service]
@@ -138,195 +383,62 @@ sudo systemctl enable cortex
 sudo systemctl start cortex
 ```
 
-## 7) API Endpoints
-
-### Health
-
-- GET /
-- Response:
-
-```json
-{
-	"message": "RAG engine running"
-}
-```
-
-### Ingest
-
-- POST /ingest
-- Supports application/json and multipart/form-data.
-- Exactly one of file_path, file, or text must be provided.
-
-Multipart/form-data example:
-
-```bash
-curl -X POST http://localhost:8000/ingest \
-	-F "user_id=user_1" \
-	-F "doc_id=doc_renewables_001" \
-	-F "file=@/absolute/path/to/report.pdf" \
-	-F "llm_provider=openai" \
-	-F "llm_api_key=YOUR_KEY" \
-	-F "llm_model=gpt-4o-mini"
-```
-
-Success response:
-
-```json
-{
-	"status": "success",
-	"doc_id": "doc_renewables_001"
-}
-```
-
-### Query
-
-- POST /query
-- Request:
-
-```json
-{
-	"query": "Summarize the wind energy section",
-	"user_id": "user_1",
-	"app_name": "default",
-	"doc_id": "doc_renewables_001",
-	"llm": {
-		"provider": "openai",
-		"api_key": "optional_key",
-		"model": "optional_model"
-	}
-}
-```
-
-Response shape:
-
-```json
-{
-	"answer": "...",
-	"sources": [
-		{
-			"section": "The Rise of Renewable Energy",
-			"page": 1,
-			"source": "The Rise of Renewable Energy. Page 1",
-			"text": "...",
-			"score": 0.90,
-			"rerank_score": 3.44
-		}
-	]
-}
-```
-
-Fallback behavior: when no context is retrieved, answer is No relevant information found. and sources is an empty list.
-
-### Generate (optional)
-
-- POST /generate
-- Request:
-
-```json
-{
-	"prompt": "Summarize this text in one paragraph",
-	"model": "optional_model"
-}
-```
-
-- Response:
-
-```json
-{
-	"answer": "..."
-}
-```
-
-## 8) Qdrant Configuration
-
-- VECTOR_SIZE defaults to 384 for BAAI/bge-small-en.
-- Qdrant collection vector size must match embedding output dimension.
-- If dimensions do not match, upserts and retrieval operations will fail.
-- Recommended approach: always initialize/recreate collection through code.
-
-Collection bootstrap command:
-
-```bash
-python3 -m scripts.setup_vector_db
-```
-
-This setup also creates payload indexes for user_id and doc_id, which are required for efficient filtered retrieval.
-
-## 9) Logging and Debugging
-
-Service status:
-
-```bash
-sudo systemctl status cortex
-```
-
-Recent logs:
-
-```bash
-journalctl -u cortex -n 100 --no-pager
-```
-
-Live logs:
-
-```bash
-journalctl -u cortex -f
-```
-
-Common issues:
-
-- Numpy not available
-	- Reinstall pinned dependencies in active venv.
-	- Command: pip install -r requirements.txt --upgrade --force-reinstall
-
-- Qdrant connection errors
-	- Verify QDRANT_MODE and required variables for that mode.
-	- Validate host/url reachability from the server.
-	- Re-run collection setup after endpoint changes.
-
-- Empty retrieval results
-	- Confirm ingestion completed for the same user_id.
-	- Verify doc_id filter is correct.
-	- Check query quality and test broader queries.
-	- Confirm collection exists and contains points.
-
-Operational smoke tests:
-
-```bash
-python3 -m scripts.test_qdrant
-python3 -m scripts.test_ingest
-python3 -m scripts.test_retrieve
-python3 -m scripts.test_generate
-```
-
-## 10) Deployment Workflow
-
-Use this sequence for each production update:
+Update workflow:
 
 ```bash
 git pull
 source .venv/bin/activate
 pip install -r requirements.txt
 sudo systemctl restart cortex
-```
-
-Post-deploy verification:
-
-```bash
 sudo systemctl status cortex
 curl -sS http://127.0.0.1:8000/
 ```
 
-## 11) Architecture Notes
+---
 
-- Cortex is an independent backend service.
-- Cortex should not contain UI logic.
-- Cortex should not contain client-facing rate limiting logic.
-- Cortex should remain focused on pure RAG orchestration: ingestion, indexing, retrieval, reranking, and LLM response generation.
+## Smoke Tests
 
-## 12) Future Improvements
+```bash
+python3 -m scripts.test_qdrant
+python3 -m scripts.test_ingest
+python3 -m scripts.test_retrieve
+python3 -m scripts.test_generate
+python3 -m scripts.test_embedding
+python3 -m scripts.test_multi_user
+```
 
-- Service-to-service authentication and request signing
-- Result caching for frequent retrieval queries
-- Metrics and monitoring (Prometheus + Grafana)
-- Structured tracing for ingestion and query latency
+---
 
+## Logging
+
+```bash
+# systemd service
+sudo systemctl status cortex
+journalctl -u cortex -n 100 --no-pager
+journalctl -u cortex -f
+
+# Local (structured JSON logs from cortex_logger)
+uvicorn main:app --reload --log-level debug
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `Unknown application: 'myapp'` | App not in registry | `POST /apps/register` with full config |
+| `OpenAI provider requires api_key` | No key in request or env | Pass `llm.api_key` or set `OPENAI_API_KEY` |
+| Qdrant connection error | Wrong mode/credentials | Check `QDRANT_MODE` and matching vars |
+| `No chunks produced` | Empty or unparseable doc | Verify file is valid and non-empty |
+| Empty retrieval results | No docs ingested for user | Re-ingest; confirm `user_id` matches |
+| Numpy / torch errors | venv out of sync | `pip install -r requirements.txt --force-reinstall` |
+
+---
+
+## Architecture Notes
+
+- Cortex is a pure backend service — no UI, no rate limiting, no user accounts.
+- All behavior per app (chunking, retrieval, generation) is driven by the registry config.
+- LLM provider and key are resolved per request: request body → env vars → local fallback.
+- The `ExecutionContext` dataclass carries all resolved config through every pipeline stage; pipeline code never reads config directly.

@@ -23,6 +23,7 @@ def retrieve_and_rerank(ctx: ExecutionContext, query: str) -> dict:
 
     retrieval_result = retrieve(ctx, query)
     chunks: List[dict] = retrieval_result.get("chunks", [])
+    retrieved_count = len(chunks)  # before reranking
 
     # Propagate early-exit conditions without reranking
     if not chunks or retrieval_result.get("clarification"):
@@ -62,6 +63,9 @@ def retrieve_and_rerank(ctx: ExecutionContext, query: str) -> dict:
 
     return {
         "chunks": chunks,
+        "retrieved_count": retrieved_count,
+        "reranked_count": len(chunks),
+        "rerank_latency_ms": round(rerank_ms, 1),
         "is_vague": retrieval_result.get("is_vague", False),
         "doc_ids": retrieval_result.get("doc_ids", []),
         "clarification": retrieval_result.get("clarification"),
