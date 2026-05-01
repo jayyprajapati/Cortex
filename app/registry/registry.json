@@ -34,6 +34,108 @@
       "system_prompt": "You are DocLens, a document intelligence assistant. Answer only from the retrieved context. Format your response in clear markdown. If the answer is not present in the context, say so explicitly."
     }
   },
+  "resumelab": {
+    "collection": "resume_memory",
+    "ingestion": {
+      "strategy": "resume_canonical",
+      "max_tokens": 512,
+      "min_tokens": 30,
+      "overlap_tokens": 0,
+      "semantic_split": false
+    },
+    "embedding": {
+      "model": "BAAI/bge-small-en",
+      "batch_size": 32,
+      "normalize": true
+    },
+    "retrieval": {
+      "top_k": 12,
+      "hybrid": true,
+      "alpha": 0.7
+    },
+    "reranking": {
+      "enabled": true,
+      "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+      "top_k": 6,
+      "candidate_cap": 24
+    },
+    "generation": {
+      "response_type": "json",
+      "temperature": 0.05,
+      "strict": true,
+      "max_retries": 3
+    },
+    "defaults": {
+      "system_prompt": "You are a structured career intelligence engine. Extract, normalize, and organize professional experience with factual accuracy."
+    },
+    "default_task": "match",
+    "tasks": {
+      "match": {
+        "system_prompt": "You are a structured career intelligence engine. Analyze the job description against the candidate's canonical profile and current resume. Return ONLY valid JSON. You MUST distinguish: (A) keywords the candidate lacks entirely vs. (B) keywords they have in their profile but omitted from the current resume. Never guess—use the pre-computed keyword analysis provided in the context.",
+        "response_type": "json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "match_score",
+            "required_keywords",
+            "missing_keywords",
+            "existing_but_missing_from_resume",
+            "irrelevant_content",
+            "recommended_additions",
+            "recommended_removals",
+            "section_rewrites",
+            "ats_keyword_clusters",
+            "role_seniority",
+            "domain_fit"
+          ],
+          "properties": {
+            "match_score": {"type": "number"},
+            "required_keywords": {"type": "array", "items": {"type": "string"}},
+            "missing_keywords": {"type": "array", "items": {"type": "string"}},
+            "existing_but_missing_from_resume": {"type": "array", "items": {"type": "string"}},
+            "irrelevant_content": {"type": "array", "items": {"type": "string"}},
+            "recommended_additions": {"type": "array", "items": {"type": "string"}},
+            "recommended_removals": {"type": "array", "items": {"type": "string"}},
+            "section_rewrites": {"type": "object"},
+            "ats_keyword_clusters": {"type": "object"},
+            "role_seniority": {"type": "string"},
+            "domain_fit": {"type": "string"}
+          }
+        },
+        "strict": true,
+        "max_retries": 3,
+        "temperature": 0.05
+      },
+      "generate": {
+        "system_prompt": "You are a structured career intelligence engine. Generate ATS-optimized resume content blocks from the candidate's canonical profile for the target role. Return ONLY valid JSON. CRITICAL: Never fabricate skills, experience, metrics, company names, titles, or dates not present in the canonical profile. Every claim must be grounded in the provided profile data.",
+        "response_type": "json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "summary",
+            "skills",
+            "projects",
+            "experience",
+            "target_keywords_used",
+            "removed_content",
+            "match_score_improved"
+          ],
+          "properties": {
+            "summary": {"type": "string"},
+            "skills": {"type": "array", "items": {"type": "string"}},
+            "projects": {"type": "array"},
+            "experience": {"type": "array"},
+            "target_keywords_used": {"type": "array", "items": {"type": "string"}},
+            "removed_content": {"type": "array", "items": {"type": "string"}},
+            "match_score_improved": {"type": "number"}
+          }
+        },
+        "strict": true,
+        "max_retries": 3,
+        "temperature": 0.05
+      }
+    }
+  },
   "cvscan": {
     "collection": "cvscan",
     "ingestion": {

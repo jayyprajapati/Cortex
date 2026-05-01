@@ -16,6 +16,20 @@ from app.pipeline.generate_pipeline import generate_answer, generate_direct
 from app.pipeline.ingest_pipeline import ingest_document, ingest_text, resolve_doc_id
 from app.registry.service import build_execution_context
 from app.vectorstore.qdrant_store import delete_document_vectors, delete_user_vectors
+from cortex.core.resume_extractor import extract_resume
+from cortex.core.profile_normalizer import merge_profiles
+from cortex.core.resume_optimizer import analyze_match, generate_document
+from cortex.schemas.resumelab import (
+    ExtractRequest,
+    ExtractResponse,
+    ProfileMergeRequest,
+    ProfileMergeResponse,
+    CanonicalProfile,
+    MatchRequest,
+    MatchResponse,
+    DocumentRequest,
+    DocumentResponse,
+)
 
 app = FastAPI(
     title="Cortex RAG Engine",
@@ -307,3 +321,328 @@ def delete_all_documents_endpoint(payload: DeleteAllRequest):
         "app_name": payload.app_name,
         "user_id": payload.user_id,
     }
+
+
+@app.post("/extract", response_model=ExtractResponse)
+async def extract_endpoint(request: Request):
+    """
+    POST /extract
+
+    Structured extraction from a resume, profile document, or raw text.
+    Accepts application/json (with text or file_path) or multipart/form-data
+    (with a file upload).
+
+    Input fields:
+      app_name        str         Required. Must be a registered Cortex app.
+      user_id         str         Required.
+      doc_id          str         Optional. Auto-generated if omitted.
+      file            upload      Multipart only. PDF, DOCX, or text file.
+      file_path       str         JSON only. Server-side path to the document.
+      text            str         Raw document text.
+      extraction_type str         "resume" | "generic_profile" | "structured_doc"
+                                  Default: "resume"
+
+    Exactly one of file, file_path, or text must be provided.
+
+    Output: ExtractResponse (see cortex/schemas/resumelab.py)
+    """
+    content_type = (request.headers.get("content-type") or "").lower()
+    uploaded_file = None
+
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+            payload = ExtractRequest(**body)
+        except (ValidationError, Exception) as exc:
+            raise HTTPException(status_code=422, detail=_sanitize(str(exc))) from exc
+
+    elif "multipart/form-data" in content_type:
+        try:
+            form = await request.form()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Unable to parse multipart form-data.") from exc
+
+        uploaded_file = form.get("file")
+        try:
+            payload = ExtractRequest(
+                app_name=str(form.get("app_name") or "").strip(),
+                user_id=str(form.get("user_id") or "").strip(),
+                doc_id=(str(form.get("doc_id") or "").strip() or None),
+                file_path=(str(form.get("file_path") or "").strip() or None),
+                text=(str(form.get("text") or "").strip() or None),
+                extraction_type=(str(form.get("extraction_type") or "resume").strip() or "resume"),
+            )
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=_sanitize(exc.errors())) from exc
+    else:
+        raise HTTPException(
+            status_code=415,
+            detail="Unsupported Content-Type. Use application/json or multipart/form-data.",
+        )
+
+    has_path = bool(payload.file_path)
+    has_upload = uploaded_file is not None and hasattr(uploaded_file, "read")
+    has_text = bool(payload.text)
+    sources = sum([has_path, has_upload, has_text])
+
+    if sources != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one of: file_path, file (upload), or text.",
+        )
+
+    # Validate app exists (fails fast with 404 for unknown app)
+    try:
+        build_execution_context(app_name=payload.app_name, user_id=payload.user_id)
+    except HTTPException:
+        raise
+
+    temp_path = None
+    try:
+        if has_upload:
+            file_bytes = await uploaded_file.read()
+            if not file_bytes:
+                raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+            suffix = os.path.splitext(uploaded_file.filename or "")[1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(file_bytes)
+                temp_path = tmp.name
+            result = extract_resume(
+                file_path=temp_path,
+                doc_id=payload.doc_id,
+                extraction_type=payload.extraction_type,
+            )
+        elif has_path:
+            result = extract_resume(
+                file_path=payload.file_path,
+                doc_id=payload.doc_id,
+                extraction_type=payload.extraction_type,
+            )
+        else:
+            result = extract_resume(
+                text=payload.text,
+                doc_id=payload.doc_id,
+                extraction_type=payload.extraction_type,
+            )
+
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    try:
+        return ExtractResponse(**result)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Extraction produced invalid response shape: {_sanitize(exc.errors())}",
+        ) from exc
+
+
+@app.post("/profile/merge", response_model=ProfileMergeResponse)
+def profile_merge_endpoint(payload: ProfileMergeRequest):
+    """
+    POST /profile/merge
+
+    Merge two profile dicts into a deduplicated CanonicalProfile.
+
+    Input:
+      app_name              str     Required. Must be a registered Cortex app.
+      user_id               str     Required.
+      existing_profile      dict    Current profile (ExtractResponse or CanonicalProfile shape).
+      incoming_profile      dict    New profile to merge in.
+      similarity_threshold  float   Optional. Cosine similarity threshold for fuzzy dedup.
+                                    Default: 0.85. Range: 0.0–1.0.
+
+    Output: ProfileMergeResponse
+      canonical_profile     CanonicalProfile  Merged, deduplicated profile.
+      added_items           dict              Items from incoming not present in existing.
+      merged_duplicates     dict              Items that were semantically merged.
+      conflicts             dict              Items with irreconcilable field disagreements.
+      stats                 dict              Before/after counts per section.
+
+    Behavior:
+      - Skill names normalized via alias map (React.js → React, AWS variants → AWS, etc.)
+      - Exact canonical_key dedup first, embedding similarity fallback second
+      - Richer content wins: longer string, higher proficiency rank, union of list fields
+      - Bullet dedup for experience: semantic similarity > 0.92 considered duplicate
+      - Conflicts surfaced for experience date disagreements (non-blocking)
+      - Source doc_id traceability preserved on every canonical item
+      - Existing Cortex apps (doclens, cvscan) are unaffected
+    """
+    try:
+        build_execution_context(app_name=payload.app_name, user_id=payload.user_id)
+    except HTTPException:
+        raise
+
+    try:
+        result = merge_profiles(
+            existing_profile=payload.existing_profile,
+            incoming_profile=payload.incoming_profile,
+            threshold=payload.similarity_threshold,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    try:
+        canonical = CanonicalProfile(**result["canonical_profile"])
+        return ProfileMergeResponse(
+            canonical_profile=canonical,
+            added_items=result["added_items"],
+            merged_duplicates=result["merged_duplicates"],
+            conflicts=result["conflicts"],
+            stats=result["stats"],
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Merge produced invalid response shape: {_sanitize(exc.errors())}",
+        ) from exc
+
+
+@app.post("/analyze/match", response_model=MatchResponse)
+def analyze_match_endpoint(payload: MatchRequest):
+    """
+    POST /analyze/match
+
+    Compare a job description against a canonical profile and an optional
+    current resume.  Returns a structured gap analysis with the critical
+    A/B distinction:
+
+      missing_keywords               — skills the candidate does NOT have at all
+      existing_but_missing_from_resume — skills in the canonical profile that
+                                         were omitted from the current resume
+                                         (immediate optimization wins)
+
+    Input:
+      app_name           str   Required. Registered Cortex app (e.g. "resumelab").
+      user_id            str   Required.
+      job_description    str   Required. Raw JD text.
+      canonical_profile  dict  Required. Phase 2 CanonicalProfile or ExtractResponse shape.
+      base_resume        dict  Optional. The user's current resume submission.
+
+    Output: MatchResponse
+      match_score                     0-100 ATS fit score
+      required_keywords               All JD keywords extracted
+      missing_keywords                Candidate lacks entirely
+      existing_but_missing_from_resume Candidate has, but didn't include in resume
+      irrelevant_content              Items to remove from resume
+      recommended_additions           Items from profile to add
+      recommended_removals            Items from resume to cut
+      section_rewrites                {summary, skills, projects}
+      ats_keyword_clusters            Keywords grouped by theme
+      role_seniority                  junior|mid|senior|lead|principal|executive
+      domain_fit                      One-sentence domain alignment assessment
+    """
+    try:
+        ctx = build_execution_context(
+            app_name=payload.app_name,
+            user_id=payload.user_id,
+            task="match",
+        )
+    except HTTPException:
+        raise
+
+    gen = ctx.effective_generation
+
+    try:
+        result = analyze_match(
+            job_description=payload.job_description,
+            canonical_profile=payload.canonical_profile,
+            base_resume=payload.base_resume,
+            llm_config=ctx.llm_config,
+            system_prompt=gen.system_prompt,
+            schema=gen.schema or {},
+            max_retries=gen.max_retries,
+            temperature=gen.temperature,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    try:
+        return MatchResponse(**result)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Match analysis produced invalid response shape: {_sanitize(exc.errors())}",
+        ) from exc
+
+
+@app.post("/generate/document", response_model=DocumentResponse)
+def generate_document_endpoint(payload: DocumentRequest):
+    """
+    POST /generate/document
+
+    Generate structured, ATS-optimized resume content blocks from a canonical
+    profile, targeted at a specific job description and template type.
+
+    TRUTHFUL ONLY — no fabricated skills, experience, metrics, or dates.
+    Every output claim is grounded in the canonical profile provided.
+
+    Input:
+      app_name           str   Required. Registered Cortex app.
+      user_id            str   Required.
+      job_description    str   Required. Raw JD text.
+      canonical_profile  dict  Required. Phase 2 CanonicalProfile dict.
+      base_resume        dict  Optional. Current resume (used for omission detection).
+      template_type      str   "frontend" | "backend" | "fullstack" (default: fullstack)
+
+    Output: DocumentResponse
+      summary              2-3 sentence professional summary with JD keywords
+      skills               Ordered flat list of skill strings, most relevant first
+      projects             Array of relevant project objects
+      experience           Array of experience objects with JD-relevant bullets
+      target_keywords_used JD keywords incorporated into the document
+      removed_content      Items excluded (with brief reason)
+      match_score_improved Estimated ATS score for the generated document (0-100)
+
+    Integration notes (ReachFlow and downstream apps):
+      - Inject summary, skills, experience, projects directly into template slots
+      - target_keywords_used can drive keyword-density validation
+      - removed_content is useful for UI diff display
+      - This endpoint does NOT write to Qdrant; call /ingest separately if desired
+    """
+    try:
+        ctx = build_execution_context(
+            app_name=payload.app_name,
+            user_id=payload.user_id,
+            task="generate",
+        )
+    except HTTPException:
+        raise
+
+    gen = ctx.effective_generation
+
+    try:
+        result = generate_document(
+            job_description=payload.job_description,
+            canonical_profile=payload.canonical_profile,
+            base_resume=payload.base_resume,
+            template_type=payload.template_type,
+            llm_config=ctx.llm_config,
+            system_prompt=gen.system_prompt,
+            schema=gen.schema or {},
+            max_retries=gen.max_retries,
+            temperature=gen.temperature,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    try:
+        return DocumentResponse(**result)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Document generation produced invalid response shape: {_sanitize(exc.errors())}",
+        ) from exc

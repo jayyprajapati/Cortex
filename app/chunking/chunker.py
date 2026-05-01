@@ -4,6 +4,7 @@ from typing import List
 
 from app.chunking.models import Chunk
 from app.chunking.strategies.markdown_aware import MarkdownAwareStrategy
+from app.chunking.strategies.resume_canonical import ResumeCanonicalStrategy
 from app.chunking.strategies.resume_structured import ResumeStructuredStrategy
 from app.chunking.strategies.semantic_doc import SemanticDocStrategy
 from app.registry.models import IngestionConfig
@@ -12,6 +13,7 @@ _REGISTRY = {
     "semantic_doc": SemanticDocStrategy,
     "resume_structured": ResumeStructuredStrategy,
     "markdown_aware": MarkdownAwareStrategy,
+    "resume_canonical": ResumeCanonicalStrategy,
 }
 
 

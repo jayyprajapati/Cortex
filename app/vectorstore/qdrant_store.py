@@ -76,6 +76,11 @@ def _create_collection(client: QdrantClient, name: str, size: int) -> None:
         field_name="doc_id",
         field_schema=PayloadSchemaType.KEYWORD,
     )
+    client.create_payload_index(
+        collection_name=name,
+        field_name="canonical_type",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
     logger.info("Created collection '%s' (vector_size=%d)", name, size)
 
 
@@ -142,6 +147,14 @@ def store_chunks(chunks: list, embeddings: list, user_id: str, collection_name: 
             payload["hierarchy"] = chunk.hierarchy
         if getattr(chunk, "token_count", None) is not None:
             payload["token_count"] = chunk.token_count
+        if getattr(chunk, "canonical_type", None):
+            payload["canonical_type"] = chunk.canonical_type
+        if getattr(chunk, "canonical_key", None):
+            payload["canonical_key"] = chunk.canonical_key
+        if getattr(chunk, "source_section", None):
+            payload["source_section"] = chunk.source_section
+        if getattr(chunk, "source_app", None):
+            payload["source_app"] = chunk.source_app
 
         vec = vector.tolist() if hasattr(vector, "tolist") else list(vector)
         points.append(PointStruct(id=str(uuid.uuid4()), vector=vec, payload=payload))

@@ -9,7 +9,7 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
 
 
 class IngestionConfig(BaseModel):
-    strategy: Literal["semantic_doc", "resume_structured", "markdown_aware"] = "semantic_doc"
+    strategy: Literal["semantic_doc", "resume_structured", "markdown_aware", "resume_canonical"] = "semantic_doc"
     max_tokens: int = 512
     min_tokens: int = 50
     overlap_tokens: int = 64

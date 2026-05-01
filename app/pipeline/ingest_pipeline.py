@@ -43,6 +43,10 @@ def _ingest_elements(ctx: ExecutionContext, elements: list, doc_id: str) -> dict
     chunks = create_chunks(elements, doc_id, ingestion_cfg)
     chunk_ms = (time.monotonic() - t_chunk) * 1000
 
+    for chunk in chunks:
+        if hasattr(chunk, "source_app"):
+            chunk.source_app = ctx.app_name
+
     if not chunks:
         raise ValueError(
             f"No chunks produced for doc_id={doc_id!r}. "
