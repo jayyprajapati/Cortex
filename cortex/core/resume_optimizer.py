@@ -346,11 +346,40 @@ JSON Output:"""
 
 
 # ---------------------------------------------------------------------------
+# Aggressiveness guidance
+# ---------------------------------------------------------------------------
+
+_AGGRESSIVENESS_GUIDANCE: Dict[str, str] = {
+    "conservative": (
+        "AGGRESSIVENESS: conservative — Minimal changes. Preserve the candidate's original "
+        "phrasing and structure as much as possible. Only add clearly missing relevant "
+        "keywords, fix glaring gaps, and remove obviously irrelevant one-liners. "
+        "Do not rewrite bullets; at most, prepend or append a keyword naturally."
+    ),
+    "balanced": (
+        "AGGRESSIVENESS: balanced — Moderate optimization. Reorder priorities to surface "
+        "the most JD-relevant content first. Strengthen the top 2-3 bullets per role "
+        "with JD keywords. Remove weak or low-relevance content. "
+        "Rephrase lightly where the original wording buries important signal."
+    ),
+    "aggressive": (
+        "AGGRESSIVENESS: aggressive — Maximum ATS optimization. Significantly restructure "
+        "the resume for keyword density and relevance. Rewrite bullets for maximum impact "
+        "using JD language. Remove all marginally relevant content. Bold keyword placement "
+        "throughout. The structure may differ substantially from the source — "
+        "but NEVER fabricate skills, metrics, companies, or titles not in the profile."
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 # Generate document prompts
 # ---------------------------------------------------------------------------
 
 _GENERATE_PROMPT = """\
 {system_prompt}
+
+{aggressiveness_guidance}
 
 {context}
 
@@ -375,6 +404,46 @@ bullets[string]}}
 - TRUTHFUL ONLY: do NOT invent skills, metrics, companies, titles, dates, or \
 project names not in the canonical profile
 - Prefer historically relevant, high-impact experience over recent but low-relevance items
+{extra_instructions}
+
+Job Description:
+{job_description}
+
+JSON Output:"""
+
+
+_MODIFY_PROMPT = """\
+{system_prompt}
+
+{aggressiveness_guidance}
+
+You are modifying an existing resume to better target a specific job description.
+Preserve the candidate's authentic voice. Perform targeted optimizations only.
+NEVER fabricate experience, skills, metrics, companies, or titles.
+
+=== SOURCE RESUME (preserve structure) ===
+{source_resume_text}
+
+{context}
+
+=== TEMPLATE TYPE: {template_type} ===
+{template_guidance}
+
+Rules:
+- Return ONLY valid JSON. No markdown fences, no prose outside the JSON object.
+- summary: rewrite or lightly adjust the summary to feature JD keywords naturally
+- skills: start from the source resume skills list; reorder and add profile skills \
+  that match JD; remove irrelevant skills according to aggressiveness level
+- projects: start from source resume projects; reorder by JD relevance; update \
+  descriptions to surface relevant keywords (truthful only)
+- experience: start from source resume experience; adjust bullets to front-load JD \
+  keywords; reorder within each role by relevance; keep original company/title/dates
+- target_keywords_used: flat list of JD keywords you successfully incorporated
+- removed_content: list of items removed (and one-word reason: "irrelevant", "weak", \
+  "redundant")
+- match_score_improved: your estimated ATS score for this modified document (0-100)
+- TRUTHFUL ONLY: only rephrase what exists — never add invented content
+{extra_instructions}
 
 Job Description:
 {job_description}
@@ -445,6 +514,26 @@ def analyze_match(
     return result
 
 
+def _format_source_resume(source_resume_content: Dict[str, Any]) -> str:
+    """Format sectioned_resume_source into a readable prompt block."""
+    lines = []
+    section_order = ["summary", "skills", "experience", "projects", "education", "certifications", "contact"]
+    seen = set()
+    for section in section_order:
+        if section in source_resume_content:
+            val = source_resume_content[section]
+            text = val if isinstance(val, str) else "\n".join(str(v) for v in val) if isinstance(val, list) else str(val)
+            if text.strip():
+                lines.append(f"[{section.upper()}]\n{text.strip()}")
+                seen.add(section)
+    for section, val in source_resume_content.items():
+        if section not in seen:
+            text = val if isinstance(val, str) else "\n".join(str(v) for v in val) if isinstance(val, list) else str(val)
+            if text.strip():
+                lines.append(f"[{section.upper()}]\n{text.strip()}")
+    return "\n\n".join(lines) if lines else "No source resume content provided."
+
+
 def generate_document(
     job_description: str,
     canonical_profile: Dict[str, Any],
@@ -455,61 +544,79 @@ def generate_document(
     schema: Dict[str, Any],
     max_retries: int = 3,
     temperature: float = 0.05,
+    mode: str = "canonical_only",
+    source_resume_content: Optional[Dict[str, Any]] = None,
+    user_tweak_prompt: Optional[str] = None,
+    include_missing_profile_keywords: bool = True,
+    include_external_keywords: bool = False,
+    remove_irrelevant_keywords: bool = True,
+    aggressiveness: str = "balanced",
 ) -> Dict[str, Any]:
     """
     Generate structured, ATS-optimized resume content blocks.
 
-    Uses the same deterministic keyword analysis as analyze_match to build
-    rich context, then asks the LLM to produce content blocks that are:
-      - Truthful (only canonical profile data)
-      - ATS-optimized (JD keywords naturally embedded)
-      - Template-aware (frontend / backend / fullstack emphasis)
-
-    Args:
-        job_description:   Raw JD text.
-        canonical_profile: Phase 2 CanonicalProfile dict.
-        base_resume:       Optional current resume dict.
-        template_type:     "frontend" | "backend" | "fullstack"
-        llm_config:        Resolved LLM provider config.
-        system_prompt:     From registry task override.
-        schema:            JSON Schema from registry task override.
-        max_retries:       LLM retry count.
-        temperature:       LLM temperature.
-
-    Returns:
-        Dict conforming to DocumentResponse schema.
-
-    Raises:
-        ValueError: If JD is empty or LLM fails.
+    mode="canonical_only": Build fresh from canonical profile (default).
+    mode="modify_existing": Targeted optimization of an existing resume structure.
+    aggressiveness: "conservative" | "balanced" | "aggressive"
     """
     jd = str(job_description or "").strip()
     if not jd:
         raise ValueError("job_description cannot be empty")
+
+    if mode == "modify_existing" and not source_resume_content:
+        raise ValueError("modify_existing mode requires source_resume_content (sectioned_resume_source from /extract).")
 
     valid_types = {"frontend", "backend", "fullstack"}
     safe_template = template_type.strip().lower() if template_type else "fullstack"
     if safe_template not in valid_types:
         safe_template = "fullstack"
 
+    safe_aggressiveness = aggressiveness if aggressiveness in _AGGRESSIVENESS_GUIDANCE else "balanced"
+    aggressiveness_guidance = _AGGRESSIVENESS_GUIDANCE[safe_aggressiveness]
+    template_guidance = _TEMPLATE_GUIDANCE[safe_template]
+
     profile_skills, resume_skills, omitted = _compute_keyword_sets(canonical_profile, base_resume)
-
     context = _format_profile_context(canonical_profile, profile_skills, resume_skills, omitted)
-    guidance = _TEMPLATE_GUIDANCE[safe_template]
 
-    prompt = _GENERATE_PROMPT.format(
-        system_prompt=system_prompt,
-        context=context,
-        template_type=safe_template.upper(),
-        template_guidance=guidance,
-        job_description=jd[:6000],
-    )
+    # Build extra instructions from strategy flags
+    extra_parts = []
+    if user_tweak_prompt and str(user_tweak_prompt).strip():
+        extra_parts.append(f"CANDIDATE PRIORITY INSTRUCTIONS: {str(user_tweak_prompt).strip()}")
+    if include_missing_profile_keywords:
+        extra_parts.append("- Include profile skills that are missing from the current resume but relevant to the JD.")
+    if include_external_keywords and not include_missing_profile_keywords:
+        extra_parts.append("- You may suggest adding industry-standard keywords not in the profile as 'suggested additions' — clearly mark them.")
+    if remove_irrelevant_keywords:
+        extra_parts.append("- Remove or deprioritize content with low relevance to this JD.")
+    extra_instructions = "\n".join(extra_parts)
+
+    if mode == "modify_existing":
+        source_text = _format_source_resume(source_resume_content)
+        prompt = _MODIFY_PROMPT.format(
+            system_prompt=system_prompt,
+            aggressiveness_guidance=aggressiveness_guidance,
+            source_resume_text=source_text,
+            context=context,
+            template_type=safe_template.upper(),
+            template_guidance=template_guidance,
+            extra_instructions=extra_instructions,
+            job_description=jd[:6000],
+        )
+    else:
+        prompt = _GENERATE_PROMPT.format(
+            system_prompt=system_prompt,
+            aggressiveness_guidance=aggressiveness_guidance,
+            context=context,
+            template_type=safe_template.upper(),
+            template_guidance=template_guidance,
+            extra_instructions=extra_instructions,
+            job_description=jd[:6000],
+        )
 
     result = _call_llm_structured(prompt, schema, llm_config, max_retries, temperature)
 
-    # Clamp match_score_improved
     if isinstance(result.get("match_score_improved"), (int, float)):
-        result["match_score_improved"] = max(
-            0.0, min(100.0, float(result["match_score_improved"]))
-        )
+        result["match_score_improved"] = max(0.0, min(100.0, float(result["match_score_improved"])))
 
+    result["mode"] = mode
     return result

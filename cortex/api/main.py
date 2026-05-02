@@ -29,6 +29,7 @@ from cortex.schemas.resumelab import (
     MatchResponse,
     DocumentRequest,
     DocumentResponse,
+    LLMOverride,
 )
 
 app = FastAPI(
@@ -49,6 +50,18 @@ _LLM_ERROR_MARKERS = (
     "llm provider", "llm extraction failed", "llm generation failed",
     "extraction failed", "generation failed",
 )
+
+
+def _llm_override_from_request(llm_field) -> Optional[dict]:
+    """Convert an optional LLMOverride schema object into the dict expected by build_execution_context."""
+    if llm_field is None:
+        return None
+    return {
+        "provider": llm_field.provider,
+        "api_key": llm_field.api_key,
+        "model": llm_field.model,
+        "base_url": llm_field.base_url,
+    }
 
 
 def _llm_status(exc: Exception) -> int:
@@ -554,10 +567,12 @@ def analyze_match_endpoint(payload: MatchRequest):
       domain_fit                      One-sentence domain alignment assessment
     """
     try:
+        llm_ov = _llm_override_from_request(payload.llm)
         ctx = build_execution_context(
             app_name=payload.app_name,
             user_id=payload.user_id,
             task="match",
+            llm_override=llm_ov,
         )
     except HTTPException:
         raise
@@ -624,10 +639,13 @@ def generate_document_endpoint(payload: DocumentRequest):
       - This endpoint does NOT write to Qdrant; call /ingest separately if desired
     """
     try:
+        llm_ov = _llm_override_from_request(payload.llm)
+        task = "modify_existing" if payload.mode == "modify_existing" else "generate"
         ctx = build_execution_context(
             app_name=payload.app_name,
             user_id=payload.user_id,
-            task="generate",
+            task=task,
+            llm_override=llm_ov,
         )
     except HTTPException:
         raise
@@ -645,6 +663,13 @@ def generate_document_endpoint(payload: DocumentRequest):
             schema=gen.schema or {},
             max_retries=gen.max_retries,
             temperature=gen.temperature,
+            mode=payload.mode,
+            source_resume_content=payload.source_resume_content,
+            user_tweak_prompt=payload.user_tweak_prompt,
+            include_missing_profile_keywords=payload.include_missing_profile_keywords,
+            include_external_keywords=payload.include_external_keywords,
+            remove_irrelevant_keywords=payload.remove_irrelevant_keywords,
+            aggressiveness=payload.aggressiveness,
         )
     except ValueError as exc:
         raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc

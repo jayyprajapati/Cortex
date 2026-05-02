@@ -337,4 +337,7 @@ def extract_resume(
             "parsed_at": datetime.now(timezone.utc).isoformat(),
             "confidence": confidence,
         },
+        # A1: Source-preservation fields — derived from the raw text, no extra LLM call.
+        "normalized_resume_text": raw_text.strip(),
+        "sectioned_resume_source": raw_sections,
     }

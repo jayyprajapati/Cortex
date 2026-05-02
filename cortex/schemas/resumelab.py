@@ -65,6 +65,9 @@ class ExtractResponse(BaseModel):
     keywords: List[str] = Field(default_factory=list)
     raw_sections: Dict[str, Any] = Field(default_factory=dict)
     metadata: ExtractMetadata
+    # Source-preservation fields (A1) — empty string / empty dict for pre-existing records.
+    normalized_resume_text: str = ""
+    sectioned_resume_source: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +174,14 @@ class SectionRewrites(BaseModel):
     projects: List[Any] = Field(default_factory=list)
 
 
+class LLMOverride(BaseModel):
+    """Optional per-request LLM provider override (BYOK)."""
+    provider: Literal["openai", "ollama_local", "ollama_cloud"] = "ollama_cloud"
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+    base_url: Optional[str] = None
+
+
 class MatchRequest(BaseModel):
     """
     Input for POST /analyze/match.
@@ -182,6 +193,7 @@ class MatchRequest(BaseModel):
     job_description: str
     canonical_profile: Dict[str, Any]
     base_resume: Optional[Dict[str, Any]] = None
+    llm: Optional[LLMOverride] = None
 
 
 class MatchResponse(BaseModel):
@@ -218,8 +230,10 @@ class ExperienceBlock(BaseModel):
 class DocumentRequest(BaseModel):
     """
     Input for POST /generate/document.
-    Generates structured, ATS-optimized resume content blocks
-    from the canonical profile, targeted at a specific JD and template type.
+
+    mode="canonical_only"  — Build fresh from canonical profile (default, existing behavior).
+    mode="modify_existing"  — Preserve the source resume structure with targeted optimizations.
+                             Requires source_resume_content (sectioned_resume_source from /extract).
     """
     app_name: str
     user_id: str
@@ -227,6 +241,15 @@ class DocumentRequest(BaseModel):
     canonical_profile: Dict[str, Any]
     base_resume: Optional[Dict[str, Any]] = None
     template_type: Literal["frontend", "backend", "fullstack"] = "fullstack"
+    llm: Optional[LLMOverride] = None
+    # Generation strategy (A3 / A4)
+    mode: Literal["canonical_only", "modify_existing"] = "canonical_only"
+    source_resume_content: Optional[Dict[str, Any]] = None   # sectioned_resume_source
+    user_tweak_prompt: Optional[str] = None
+    include_missing_profile_keywords: bool = True
+    include_external_keywords: bool = False
+    remove_irrelevant_keywords: bool = True
+    aggressiveness: Literal["conservative", "balanced", "aggressive"] = "balanced"
 
 
 class DocumentResponse(BaseModel):
@@ -241,3 +264,4 @@ class DocumentResponse(BaseModel):
     target_keywords_used: List[str]
     removed_content: List[str]
     match_score_improved: float = Field(ge=0.0, le=100.0)
+    mode: str = "canonical_only"

@@ -106,6 +106,26 @@
         "max_retries": 3,
         "temperature": 0.05
       },
+      "modify_existing": {
+        "system_prompt": "You are a structured career intelligence engine performing targeted optimization of an existing resume. Preserve the candidate's authentic voice and original experience. Rewrite and reorder to maximize JD relevance. Never fabricate content not present in the canonical profile. Return ONLY valid JSON.",
+        "response_type": "json",
+        "schema": {
+          "type": "object",
+          "required": ["summary", "skills", "projects", "experience", "target_keywords_used", "removed_content", "match_score_improved"],
+          "properties": {
+            "summary": {"type": "string"},
+            "skills": {"type": "array", "items": {"type": "string"}},
+            "projects": {"type": "array"},
+            "experience": {"type": "array"},
+            "target_keywords_used": {"type": "array", "items": {"type": "string"}},
+            "removed_content": {"type": "array", "items": {"type": "string"}},
+            "match_score_improved": {"type": "number"}
+          }
+        },
+        "strict": true,
+        "max_retries": 3,
+        "temperature": 0.05
+      },
       "generate": {
         "system_prompt": "You are a structured career intelligence engine. Generate ATS-optimized resume content blocks from the candidate's canonical profile for the target role. Return ONLY valid JSON. CRITICAL: Never fabricate skills, experience, metrics, company names, titles, or dates not present in the canonical profile. Every claim must be grounded in the provided profile data.",
         "response_type": "json",
