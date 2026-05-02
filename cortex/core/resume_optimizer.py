@@ -36,6 +36,17 @@ from app.pipeline.generate_pipeline import (
 
 logger = logging.getLogger(__name__)
 
+_LLM_AUTH_KEYWORDS = frozenset({
+    "unauthorized", "forbidden", "authentication", "api key",
+    "invalid token", "invalid key", " 401", " 403",
+})
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    msg = str(exc).strip().lower()
+    return any(kw in msg for kw in _LLM_AUTH_KEYWORDS)
+
+
 # ---------------------------------------------------------------------------
 # Template-type guidance injected into the generate prompt
 # ---------------------------------------------------------------------------
@@ -275,6 +286,11 @@ def _call_llm_structured(
             )
             return parsed
         except Exception as exc:
+            if _is_auth_error(exc):
+                raise ValueError(
+                    f"LLM provider authentication failed: {exc}. "
+                    "Verify your API key in the environment configuration."
+                ) from exc
             last_error = exc
             logger.warning(
                 "optimizer LLM attempt %d/%d failed: %s",

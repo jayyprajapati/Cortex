@@ -45,6 +45,18 @@ app.add_middleware(
 )
 
 
+_LLM_ERROR_MARKERS = (
+    "llm provider", "llm extraction failed", "llm generation failed",
+    "extraction failed", "generation failed",
+)
+
+
+def _llm_status(exc: Exception) -> int:
+    """Return 502 when the failure is from the LLM provider, 400 for input errors."""
+    msg = str(exc).lower()
+    return 502 if any(m in msg for m in _LLM_ERROR_MARKERS) else 400
+
+
 def _sanitize(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray, memoryview)):
         return f"<binary:{len(value)} bytes>"
@@ -428,7 +440,7 @@ async def extract_endpoint(request: Request):
     except HTTPException:
         raise
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
@@ -564,7 +576,7 @@ def analyze_match_endpoint(payload: MatchRequest):
             temperature=gen.temperature,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -635,7 +647,7 @@ def generate_document_endpoint(payload: DocumentRequest):
             temperature=gen.temperature,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

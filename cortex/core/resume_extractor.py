@@ -107,6 +107,19 @@ _REQUIRED_KEYS = frozenset({
 
 _ARRAY_KEYS = ("skills", "projects", "experience", "education", "certifications", "keywords")
 
+# Keywords that indicate an LLM provider-level error (auth, network, quota).
+# These should not be retried — they will keep failing identically.
+_LLM_AUTH_KEYWORDS = frozenset({
+    "unauthorized", "forbidden", "authentication", "api key",
+    "invalid token", "invalid key", " 401", " 403",
+})
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    """Return True if the exception looks like an LLM provider auth/permission failure."""
+    msg = str(exc).strip().lower()
+    return any(kw in msg for kw in _LLM_AUTH_KEYWORDS)
+
 
 # ---------------------------------------------------------------------------
 # Section splitting
@@ -273,6 +286,12 @@ def extract_resume(
             )
             break
         except Exception as exc:
+            # Auth/permission errors will keep failing — skip retries immediately.
+            if _is_auth_error(exc):
+                raise ValueError(
+                    f"LLM provider authentication failed: {exc}. "
+                    "Verify your API key in the environment configuration."
+                ) from exc
             last_error = exc
             logger.warning(
                 "resume_extractor attempt %d/%d failed: %s",
@@ -288,7 +307,7 @@ def extract_resume(
 
     if parsed is None:
         raise ValueError(
-            f"Extraction failed after {max_retries + 1} attempts. "
+            f"LLM extraction failed after {max_retries + 1} attempts. "
             f"Last error: {last_error}"
         )
 
