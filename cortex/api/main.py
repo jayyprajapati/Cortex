@@ -32,10 +32,14 @@ from cortex.schemas.resumelab import (
     LLMOverride,
 )
 
+_env = os.getenv("APP_ENV") or os.getenv("ENV") or os.getenv("PYTHON_ENV") or "development"
+_is_prod = str(_env).lower() in ("production", "prod")
+
 app = FastAPI(
     title="Cortex RAG Engine",
     description="Registry-driven multi-application RAG orchestration",
     version="2.0.0",
+    **({"docs_url": None, "redoc_url": None, "openapi_url": None} if _is_prod else {}),
 )
 
 app.add_middleware(
