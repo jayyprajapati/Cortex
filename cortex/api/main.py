@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from typing import Any, List, Literal, Optional
@@ -12,9 +13,10 @@ from pydantic import BaseModel, ValidationError
 
 from app.api.applications import router as applications_router
 from app.api.collections import router as collections_router
+from app.llm.factory import get_llm
 from app.pipeline.generate_pipeline import generate_answer, generate_direct
 from app.pipeline.ingest_pipeline import ingest_document, ingest_text, resolve_doc_id
-from app.registry.service import build_execution_context
+from app.registry.service import _resolve_llm_config, build_execution_context
 from app.vectorstore.qdrant_store import delete_document_vectors, delete_user_vectors
 from cortex.core.resume_extractor import extract_resume
 from cortex.core.profile_normalizer import merge_profiles
@@ -153,9 +155,45 @@ app.include_router(collections_router)
 # Endpoints
 # ---------------------------------------------------------------------------
 
+class LLMPingRequest(BaseModel):
+    llm: LLMOverride
+
+
 @app.get("/")
 def root():
     return {"message": "Cortex RAG Engine v2.0 — registry-driven"}
+
+
+@app.post("/llm/ping")
+def llm_ping_endpoint(payload: LLMPingRequest):
+    """
+    POST /llm/ping
+
+    Makes a minimal one-token LLM call to verify provider connectivity.
+    Used by the Settings test-connection flow — much faster than /analyze/match.
+    Requires an explicit llm override; never falls back to env-configured defaults.
+    """
+    llm_override = {
+        "provider": payload.llm.provider,
+        "api_key": payload.llm.api_key,
+        "model": payload.llm.model,
+        "base_url": payload.llm.base_url,
+    }
+    try:
+        llm_config = _resolve_llm_config(llm_override)
+    except HTTPException:
+        raise
+
+    try:
+        llm_instance = get_llm(llm_config)
+        llm_instance.generate("Reply with exactly: ok", temperature=0.0)
+        return {
+            "ok": True,
+            "provider": llm_config.provider,
+            "model": llm_config.model,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM provider error: {exc}") from exc
 
 
 @app.post("/ingest")
@@ -392,6 +430,14 @@ async def extract_endpoint(request: Request):
             raise HTTPException(status_code=400, detail="Unable to parse multipart form-data.") from exc
 
         uploaded_file = form.get("file")
+        llm_json_str = str(form.get("llm") or "").strip()
+        llm_from_form: Optional[LLMOverride] = None
+        if llm_json_str:
+            try:
+                llm_from_form = LLMOverride(**json.loads(llm_json_str))
+            except (ValueError, TypeError, ValidationError):
+                pass
+
         try:
             payload = ExtractRequest(
                 app_name=str(form.get("app_name") or "").strip(),
@@ -400,6 +446,7 @@ async def extract_endpoint(request: Request):
                 file_path=(str(form.get("file_path") or "").strip() or None),
                 text=(str(form.get("text") or "").strip() or None),
                 extraction_type=(str(form.get("extraction_type") or "resume").strip() or "resume"),
+                llm=llm_from_form,
             )
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=_sanitize(exc.errors())) from exc
@@ -426,6 +473,8 @@ async def extract_endpoint(request: Request):
     except HTTPException:
         raise
 
+    llm_ov = _llm_override_from_request(payload.llm)
+
     temp_path = None
     try:
         if has_upload:
@@ -440,18 +489,21 @@ async def extract_endpoint(request: Request):
                 file_path=temp_path,
                 doc_id=payload.doc_id,
                 extraction_type=payload.extraction_type,
+                llm_override=llm_ov,
             )
         elif has_path:
             result = extract_resume(
                 file_path=payload.file_path,
                 doc_id=payload.doc_id,
                 extraction_type=payload.extraction_type,
+                llm_override=llm_ov,
             )
         else:
             result = extract_resume(
                 text=payload.text,
                 doc_id=payload.doc_id,
                 extraction_type=payload.extraction_type,
+                llm_override=llm_ov,
             )
 
     except HTTPException:

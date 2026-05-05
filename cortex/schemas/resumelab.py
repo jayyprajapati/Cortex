@@ -52,6 +52,7 @@ class ExtractRequest(BaseModel):
     file_path: Optional[str] = None
     text: Optional[str] = None
     extraction_type: Literal["resume", "generic_profile", "structured_doc"] = "resume"
+    llm: Optional[LLMOverride] = None
 
 
 class ExtractResponse(BaseModel):

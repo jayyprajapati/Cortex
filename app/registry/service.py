@@ -27,7 +27,8 @@ def _resolve_llm_config(llm_override: Optional[Dict[str, Any]] = None) -> LLMCon
             return LLMConfig(provider="openai", model=model or "gpt-4o-mini", api_key=resolved_key)
 
         if provider in {"ollama_local", "ollama"}:
-            return LLMConfig(provider="ollama_local", model=model or "llama3")
+            base_url = str(llm_override.get("base_url") or "").strip() or None
+            return LLMConfig(provider="ollama_local", model=model or "llama3", base_url=base_url)
 
         if provider == "ollama_cloud":
             resolved_key = api_key or OLLAMA_CLOUD_API_KEY

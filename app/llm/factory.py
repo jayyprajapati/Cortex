@@ -11,7 +11,7 @@ def get_llm(config: LLMConfig) -> BaseLLM:
     provider = config.provider
 
     if provider == "ollama_local":
-        return OllamaLocalLLM(model=config.model)
+        return OllamaLocalLLM(model=config.model, base_url=config.base_url or "")
 
     if provider == "ollama_cloud":
         if not config.api_key:

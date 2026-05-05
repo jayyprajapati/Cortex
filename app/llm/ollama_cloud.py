@@ -12,6 +12,7 @@ class OllamaCloudLLM(BaseLLM):
         self._client = Client(
             host="https://ollama.com",
             headers={"Authorization": f"Bearer {api_key}"},
+            timeout=300,
         )
         self.model = model
 

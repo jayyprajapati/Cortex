@@ -398,8 +398,9 @@ date_range|null, relevance_note}}
 JD-relevant bullets. Each object: {{company, title, date_range|null, location|null, \
 bullets[string]}}
 - target_keywords_used: flat list of JD keywords you successfully incorporated
-- removed_content: list of items excluded from the output (and one-word reason: \
-"irrelevant", "weak", "redundant")
+- removed_content: flat list of plain strings ONLY — format each entry as \
+"item name (reason)" where reason is one word: "irrelevant", "weak", or "redundant". \
+Example: ["Ruby (irrelevant)", "Excel (weak)"]. NO objects, NO dicts — strings only.
 - match_score_improved: your estimated ATS score for this generated document (0-100)
 - TRUTHFUL ONLY: do NOT invent skills, metrics, companies, titles, dates, or \
 project names not in the canonical profile
@@ -439,8 +440,9 @@ Rules:
 - experience: start from source resume experience; adjust bullets to front-load JD \
   keywords; reorder within each role by relevance; keep original company/title/dates
 - target_keywords_used: flat list of JD keywords you successfully incorporated
-- removed_content: list of items removed (and one-word reason: "irrelevant", "weak", \
-  "redundant")
+- removed_content: flat list of plain strings ONLY — format each entry as \
+  "item name (reason)" where reason is one word: "irrelevant", "weak", or "redundant". \
+  Example: ["Ruby (irrelevant)", "Excel (weak)"]. NO objects, NO dicts — strings only.
 - match_score_improved: your estimated ATS score for this modified document (0-100)
 - TRUTHFUL ONLY: only rephrase what exists — never add invented content
 {extra_instructions}
@@ -617,6 +619,19 @@ def generate_document(
 
     if isinstance(result.get("match_score_improved"), (int, float)):
         result["match_score_improved"] = max(0.0, min(100.0, float(result["match_score_improved"])))
+
+    # Coerce removed_content entries to strings — the LLM sometimes returns dicts
+    rc = result.get("removed_content")
+    if isinstance(rc, list):
+        coerced = []
+        for item in rc:
+            if isinstance(item, str):
+                coerced.append(item)
+            elif isinstance(item, dict):
+                name = item.get("item") or item.get("name") or item.get("content") or ""
+                reason = item.get("reason") or ""
+                coerced.append(f"{name} ({reason})" if reason else name)
+        result["removed_content"] = coerced
 
     result["mode"] = mode
     return result

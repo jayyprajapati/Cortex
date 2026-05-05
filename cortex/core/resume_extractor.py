@@ -8,9 +8,24 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import hashlib
+
 from app.ingestion.loader import load_document
 from app.llm.factory import get_llm
 from app.registry.service import _resolve_llm_config
+
+# ---------------------------------------------------------------------------
+# In-process extraction cache — keyed by sha256(raw_text):extraction_type
+# Avoids re-running the LLM when the same file is uploaded more than once.
+# ---------------------------------------------------------------------------
+
+_EXTRACT_CACHE: Dict[str, Dict[str, Any]] = {}
+_MAX_EXTRACT_CACHE = 50
+
+
+def _extract_cache_key(raw_text: str, extraction_type: str) -> str:
+    digest = hashlib.sha256(raw_text.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"{digest}:{extraction_type}"
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +278,20 @@ def extract_resume(
 
     fallback_sections = split_sections(raw_text)
 
+    cache_key = _extract_cache_key(raw_text, extraction_type)
+    if cache_key in _EXTRACT_CACHE:
+        cached = _EXTRACT_CACHE[cache_key]
+        logger.info("resume_extractor cache hit doc_id=%s", resolved_doc_id)
+        return {
+            **cached,
+            "doc_id": resolved_doc_id,
+            "metadata": {
+                **cached["metadata"],
+                "parsed_at": datetime.now(timezone.utc).isoformat(),
+                "cache_hit": True,
+            },
+        }
+
     llm_config = _resolve_llm_config(llm_override)
     llm = get_llm(llm_config)
 
@@ -322,7 +351,7 @@ def extract_resume(
         confidence = 0.5
     confidence = max(0.0, min(1.0, confidence))
 
-    return {
+    result = {
         "doc_id": resolved_doc_id,
         "document_type": str(parsed.get("document_type") or extraction_type),
         "skills": parsed.get("skills") or [],
@@ -341,3 +370,9 @@ def extract_resume(
         "normalized_resume_text": raw_text.strip(),
         "sectioned_resume_source": raw_sections,
     }
+
+    if len(_EXTRACT_CACHE) >= _MAX_EXTRACT_CACHE:
+        oldest = next(iter(_EXTRACT_CACHE))
+        del _EXTRACT_CACHE[oldest]
+    _EXTRACT_CACHE[cache_key] = result
+    return result
