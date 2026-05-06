@@ -28,7 +28,7 @@ python3 -m scripts.test_resumelab_merge
 cd frontend && npm install && npm run dev
 ```
 
-Scripts must be run as modules (`python3 -m scripts.foo`), not as files.
+Scripts must be run as modules (`python3 -m scripts.foo`), not as files. There is no pytest/lint setup — `tests/` is an empty package; the `scripts/test_*.py` files are runnable smoke tests, not unit tests.
 
 ## Architecture
 
@@ -50,13 +50,16 @@ Request → build_execution_context()
 - `app/context.py` — `ExecutionContext` and `LLMConfig` dataclasses. The `ExecutionContext` is built once per request and passed through every pipeline stage. Pipeline code **never** reads config or env vars directly.
 - `app/registry/service.py` — `build_execution_context()` and `_resolve_llm_config()`. LLM resolution order: request body `llm` field → env vars → `ollama_local` fallback.
 - `app/registry/models.py` — Pydantic models for `ApplicationConfig` (ingestion, embedding, retrieval, reranking, generation, tasks).
-- `app/registry/registry.json` — persisted app registrations (pre-loaded: `doclens`, `cvscan`).
+- `app/registry/registry.json` — persisted app registrations (pre-loaded: `doclens`, `cvscan`, `resumelab`).
+- `app/api/applications.py`, `app/api/collections.py` — routers mounted in `cortex/api/main.py` for `/apps/*` and `/collections/*` CRUD.
 - `app/pipeline/ingest_pipeline.py` — load → chunk → embed → Qdrant upsert.
 - `app/pipeline/retrieve_pipeline.py` — embed query → hybrid search → rerank.
 - `app/pipeline/generate_pipeline.py` — LLM call with retry, JSON extraction, schema validation.
 - `app/config.py` — Qdrant client (cached via `@lru_cache`) and LLM env-var defaults.
 
 **Ingestion strategies** (in `app/chunking/strategies/`): `semantic_doc`, `resume_structured`, `markdown_aware`, `resume_canonical`. Strategy is set per registered app.
+
+**Tasks**: `ApplicationConfig.tasks` is a map of named task overrides (e.g. `match`, `generate`, `modify_existing`). Passing `task=<name>` on `/query`, `/generate`, or via `build_execution_context()` swaps in that task's `system_prompt`, `schema`, `temperature`, etc. on top of the app's defaults — see `ctx.effective_generation`.
 
 ### 2. ResumeLab (`cortex/`)
 
@@ -67,6 +70,7 @@ Domain-specific resume intelligence layer. No Qdrant reads/writes — purely LLM
 - `POST /profile/merge` — deduplicate two `CanonicalProfile`s via cosine similarity
 - `POST /analyze/match` — score a JD against a profile; returns missing/omitted keywords
 - `POST /generate/document` — produce ATS-optimised resume content blocks
+- `POST /llm/ping` — minimal one-token call to verify provider connectivity. Requires an explicit `llm` override; never falls back to env defaults. Used by the frontend Settings test-connection flow.
 
 **Key files:**
 - `cortex/core/resume_extractor.py` — regex section detection + LLM extraction with cache
@@ -83,7 +87,7 @@ Three providers via `app/llm/factory.py`:
 - `ollama_cloud` — requires `OLLAMA_CLOUD_API_KEY`
 - `openai` — requires `OPENAI_API_KEY`
 
-Auth errors from any provider propagate as HTTP 401 in `cortex/api/main.py`.
+Error code conventions in `cortex/api/main.py`: provider auth failures → 401, LLM provider/runtime errors → 502 (detected by message markers in `_LLM_ERROR_MARKERS`), input/validation errors → 400/422, unknown app → 404.
 
 ### Frontend (`frontend/`)
 
