@@ -34,6 +34,14 @@ from app.pipeline.generate_pipeline import (
     _validate_schema,
 )
 
+# Module-level cache for tweak routing results (keyed by hash of the input text)
+_tweak_routing_cache: Dict[str, Dict[str, List[str]]] = {}
+
+# Lazy import to avoid circular dependency — composition imports from this module
+def _get_user_style_block(user_system_prompt: Optional[str]) -> str:
+    from cortex.core.composition import _build_user_style_block  # noqa: PLC0415
+    return _build_user_style_block(user_system_prompt)
+
 logger = logging.getLogger(__name__)
 
 _LLM_AUTH_KEYWORDS = frozenset({
@@ -167,6 +175,9 @@ def _fmt_experience(canonical_profile: Dict[str, Any], max_bullets: int = 3) -> 
         for b in (exp.get("bullets") or [])[:max_bullets]:
             if b:
                 lines.append(f"   • {b.strip()}")
+        showcase = str(exp.get("showcase_prompt") or "").strip()
+        if showcase:
+            lines.append(f"   ↳ USER NOTE: {showcase[:300]}")
     return "\n".join(lines) if lines else "None listed"
 
 
@@ -187,6 +198,9 @@ def _fmt_projects(canonical_profile: Dict[str, Any]) -> str:
         if url:
             line += f" ({url})"
         lines.append(line)
+        showcase = str(proj.get("showcase_prompt") or "").strip()
+        if showcase:
+            lines.append(f"  ↳ USER NOTE: {showcase[:300]}")
     return "\n".join(lines) if lines else "None listed"
 
 
@@ -311,6 +325,74 @@ def _call_llm_structured(
 
 
 # ---------------------------------------------------------------------------
+# Section-routed tweak helpers
+# ---------------------------------------------------------------------------
+
+_ROUTE_TWEAKS_PROMPT = """\
+Route each user instruction to the resume section it applies to.
+Sections: summary | skills | experience_bullets | projects | global
+
+Output ONLY valid JSON with this exact shape:
+{{"summary": [...], "skills": [...], "experience_bullets": [...], "projects": [...], "global": [...]}}
+
+Examples:
+Input: "Highlight technical skills inside work experience bullets"
+Output: {{"summary": [], "skills": [], "experience_bullets": ["Highlight technical skills inside bullet text"], "projects": [], "global": []}}
+
+Input: "Keep it concise and put React first"
+Output: {{"summary": ["Keep concise"], "skills": ["Order: React first"], "experience_bullets": [], "projects": [], "global": []}}
+
+Input: {user_tweak_prompt}
+Output:"""
+
+_ROUTE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "required": ["summary", "skills", "experience_bullets", "projects", "global"],
+    "properties": {
+        "summary": {"type": "array", "items": {"type": "string"}},
+        "skills": {"type": "array", "items": {"type": "string"}},
+        "experience_bullets": {"type": "array", "items": {"type": "string"}},
+        "projects": {"type": "array", "items": {"type": "string"}},
+        "global": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+
+def _route_user_tweaks(user_tweak_prompt: str, llm_config: LLMConfig) -> Dict[str, List[str]]:
+    """Route user instructions to specific resume sections via a small LLM call. Cached by input hash."""
+    text = str(user_tweak_prompt or "").strip()
+    empty: Dict[str, List[str]] = {
+        "summary": [], "skills": [], "experience_bullets": [], "projects": [], "global": []
+    }
+    if not text:
+        return empty
+
+    cache_key = str(hash(text))
+    if cache_key in _tweak_routing_cache:
+        return _tweak_routing_cache[cache_key]
+
+    prompt = _ROUTE_TWEAKS_PROMPT.format(user_tweak_prompt=text)
+    try:
+        result = _call_llm_structured(prompt, _ROUTE_SCHEMA, llm_config, max_retries=1, temperature=0.0)
+    except Exception as exc:
+        logger.warning("tweak routing failed, falling back to global bucket: %s", exc)
+        result = {**empty, "global": [text]}
+
+    _tweak_routing_cache[cache_key] = result
+    return result
+
+
+def _format_tweaks_block(instructions: List[str]) -> str:
+    """Format routed instructions as an indented annotation block, or empty string."""
+    if not instructions:
+        return ""
+    lines = ["   (user style guidance):"]
+    for instr in instructions:
+        lines.append(f"   * {instr}")
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Match analysis prompts
 # ---------------------------------------------------------------------------
 
@@ -378,7 +460,7 @@ _AGGRESSIVENESS_GUIDANCE: Dict[str, str] = {
 
 _GENERATE_PROMPT = """\
 {system_prompt}
-
+{user_style_block}
 {aggressiveness_guidance}
 
 {context}
@@ -389,14 +471,18 @@ _GENERATE_PROMPT = """\
 Rules:
 - Return ONLY valid JSON. No markdown fences, no prose outside the JSON object.
 - summary: 2-3 sentences, professional tone, naturally embed JD keywords
+{summary_tweaks_block}\
 - skills: flat ordered list of skill name strings, most JD-relevant first, \
 max 20 items; exclude irrelevant skills
+{skills_tweaks_block}\
 - projects: array of project objects — pick the most JD-relevant projects from the \
 canonical profile. Each object: {{name, description, technologies[string], url|null, \
 date_range|null, relevance_note}}
+{projects_tweaks_block}\
 - experience: array of experience objects — for each relevant role keep the 3-4 most \
 JD-relevant bullets. Each object: {{company, title, date_range|null, location|null, \
 bullets[string]}}
+{experience_tweaks_block}\
 - target_keywords_used: flat list of JD keywords you successfully incorporated
 - removed_content: flat list of plain strings ONLY — format each entry as \
 "item name (reason)" where reason is one word: "irrelevant", "weak", or "redundant". \
@@ -415,14 +501,14 @@ JSON Output:"""
 
 _MODIFY_PROMPT = """\
 {system_prompt}
-
+{user_style_block}
 {aggressiveness_guidance}
 
 You are modifying an existing resume to better target a specific job description.
 Preserve the candidate's authentic voice. Perform targeted optimizations only.
 NEVER fabricate experience, skills, metrics, companies, or titles.
-
-=== SOURCE RESUME (preserve structure) ===
+{original_resume_text_block}
+=== SOURCE RESUME (structured sections) ===
 {source_resume_text}
 
 {context}
@@ -432,13 +518,22 @@ NEVER fabricate experience, skills, metrics, companies, or titles.
 
 Rules:
 - Return ONLY valid JSON. No markdown fences, no prose outside the JSON object.
+- VERBATIM PRESERVATION: Mirror every sentence, bullet, and phrase from the ORIGINAL \
+  RESUME (if provided above) exactly. Only edit a sentence when: (a) JD relevance demands \
+  a concrete change, (b) factual accuracy requires it, or (c) user instructions explicitly \
+  request it. Do not paraphrase for stylistic reasons alone.
 - summary: rewrite or lightly adjust the summary to feature JD keywords naturally
+{summary_tweaks_block}\
 - skills: start from the source resume skills list; reorder and add profile skills \
   that match JD; remove irrelevant skills according to aggressiveness level
+{skills_tweaks_block}\
 - projects: start from source resume projects; reorder by JD relevance; update \
   descriptions to surface relevant keywords (truthful only)
+{projects_tweaks_block}\
 - experience: start from source resume experience; adjust bullets to front-load JD \
-  keywords; reorder within each role by relevance; keep original company/title/dates
+  keywords; reorder within each role by relevance; keep original company/title/dates. \
+  Preserve original bullet wording verbatim unless a targeted edit is needed.
+{experience_tweaks_block}\
 - target_keywords_used: flat list of JD keywords you successfully incorporated
 - removed_content: flat list of plain strings ONLY — format each entry as \
   "item name (reason)" where reason is one word: "irrelevant", "weak", or "redundant". \
@@ -548,7 +643,9 @@ def generate_document(
     temperature: float = 0.05,
     mode: str = "canonical_only",
     source_resume_content: Optional[Dict[str, Any]] = None,
+    original_resume_text: Optional[str] = None,
     user_tweak_prompt: Optional[str] = None,
+    user_system_prompt: Optional[str] = None,
     include_missing_profile_keywords: bool = True,
     include_external_keywords: bool = False,
     remove_irrelevant_keywords: bool = True,
@@ -580,10 +677,25 @@ def generate_document(
     profile_skills, resume_skills, omitted = _compute_keyword_sets(canonical_profile, base_resume)
     context = _format_profile_context(canonical_profile, profile_skills, resume_skills, omitted)
 
-    # Build extra instructions from strategy flags
-    extra_parts = []
+    # Route user tweaks to per-section annotation blocks
+    routed: Dict[str, List[str]] = {
+        "summary": [], "skills": [], "experience_bullets": [], "projects": [], "global": []
+    }
     if user_tweak_prompt and str(user_tweak_prompt).strip():
-        extra_parts.append(f"CANDIDATE PRIORITY INSTRUCTIONS: {str(user_tweak_prompt).strip()}")
+        routed = _route_user_tweaks(str(user_tweak_prompt).strip(), llm_config)
+
+    summary_tweaks_block = _format_tweaks_block(routed.get("summary") or [])
+    skills_tweaks_block = _format_tweaks_block(routed.get("skills") or [])
+    experience_tweaks_block = _format_tweaks_block(routed.get("experience_bullets") or [])
+    projects_tweaks_block = _format_tweaks_block(routed.get("projects") or [])
+
+    # Build extra instructions from strategy flags + global tweaks
+    extra_parts = []
+    global_tweaks = routed.get("global") or []
+    if global_tweaks:
+        extra_parts.append("CANDIDATE PRIORITY INSTRUCTIONS:")
+        for g in global_tweaks:
+            extra_parts.append(f"  * {g}")
     if include_missing_profile_keywords:
         extra_parts.append("- Include profile skills that are missing from the current resume but relevant to the JD.")
     if include_external_keywords and not include_missing_profile_keywords:
@@ -592,25 +704,45 @@ def generate_document(
         extra_parts.append("- Remove or deprioritize content with low relevance to this JD.")
     extra_instructions = "\n".join(extra_parts)
 
+    # Build user style block from settings system prompt (4B+4E)
+    user_style_block = _get_user_style_block(user_system_prompt)
+
     if mode == "modify_existing":
         source_text = _format_source_resume(source_resume_content)
+        # Build original resume text block for verbatim preservation (4D)
+        orig_text = str(original_resume_text or "").strip()
+        original_resume_text_block = (
+            f"\n=== ORIGINAL RESUME (preserve verbatim where possible) ===\n{orig_text[:8000]}\n=== END ORIGINAL ===\n"
+            if orig_text else ""
+        )
         prompt = _MODIFY_PROMPT.format(
             system_prompt=system_prompt,
+            user_style_block=user_style_block,
             aggressiveness_guidance=aggressiveness_guidance,
+            original_resume_text_block=original_resume_text_block,
             source_resume_text=source_text,
             context=context,
             template_type=safe_template.upper(),
             template_guidance=template_guidance,
+            summary_tweaks_block=summary_tweaks_block,
+            skills_tweaks_block=skills_tweaks_block,
+            projects_tweaks_block=projects_tweaks_block,
+            experience_tweaks_block=experience_tweaks_block,
             extra_instructions=extra_instructions,
             job_description=jd[:6000],
         )
     else:
         prompt = _GENERATE_PROMPT.format(
             system_prompt=system_prompt,
+            user_style_block=user_style_block,
             aggressiveness_guidance=aggressiveness_guidance,
             context=context,
             template_type=safe_template.upper(),
             template_guidance=template_guidance,
+            summary_tweaks_block=summary_tweaks_block,
+            skills_tweaks_block=skills_tweaks_block,
+            projects_tweaks_block=projects_tweaks_block,
+            experience_tweaks_block=experience_tweaks_block,
             extra_instructions=extra_instructions,
             job_description=jd[:6000],
         )

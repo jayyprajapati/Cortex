@@ -1,0 +1,8 @@
+# Eval run output — generated per run, not checked in
+results/
+
+# Test resume (may contain personal data)
+golden/doclens/resume.pdf
+
+# Synthetic profile (generated from real data)
+golden/resumelab/profile.json

@@ -31,9 +31,11 @@ def _format_point(point) -> dict:
         "text": str(payload.get("text") or "").strip(),
         "page": payload.get("page"),
         "doc_id": payload.get("doc_id"),
+        "chunk_id": payload.get("chunk_id"),
         "section": payload.get("section"),
         "hierarchy": payload.get("hierarchy"),
         "token_count": payload.get("token_count"),
+        "entity_hints": payload.get("entity_hints") or [],
         "score": float(getattr(point, "score", 0.0)),
         "dense_score": float(getattr(point, "score", 0.0)),
     }
@@ -100,7 +102,15 @@ def retrieve(ctx: ExecutionContext, query: str) -> dict:
 
     # --- BM25 scoring on dense candidates ---
     if retrieval_cfg.hybrid and len(chunks) > 1:
-        bm25 = BM25([c["text"] for c in chunks])
+        # Entity hints are appended to the BM25 token stream only (LLM-facing
+        # text in chunk["text"] is untouched). This boosts recall for identity
+        # and synonym queries (e.g. "who is the developer") without polluting
+        # the generation prompt.
+        bm25_corpus = [
+            (c["text"] + " " + " ".join(c.get("entity_hints") or [])).strip()
+            for c in chunks
+        ]
+        bm25 = BM25(bm25_corpus)
         bm25_raw = bm25.get_scores(query)
 
         dense_raw = [c["dense_score"] for c in chunks]

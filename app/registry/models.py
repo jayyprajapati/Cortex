@@ -79,6 +79,7 @@ class RetrievalConfig(BaseModel):
     hybrid: bool = True
     alpha: float = 0.7
     metadata_filter: Optional[Dict[str, Any]] = None
+    query_rewrite: bool = False
 
     @field_validator("top_k")
     @classmethod
@@ -100,6 +101,7 @@ class RerankingConfig(BaseModel):
     model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     top_k: int = 5
     candidate_cap: int = 20
+    diversity: float = 0.0
 
     @field_validator("top_k")
     @classmethod
@@ -115,6 +117,13 @@ class RerankingConfig(BaseModel):
             raise ValueError("candidate_cap must be between 1 and 500")
         return v
 
+    @field_validator("diversity")
+    @classmethod
+    def _diversity(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("diversity must be between 0.0 and 1.0")
+        return v
+
     @model_validator(mode="after")
     def _top_k_lte_cap(self) -> RerankingConfig:
         if self.enabled and self.top_k > self.candidate_cap:
@@ -125,11 +134,13 @@ class RerankingConfig(BaseModel):
 class GenerationConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    response_type: Literal["markdown", "json"] = "markdown"
+    response_type: Literal["markdown", "json", "text"] = "markdown"
     output_schema: Optional[Dict[str, Any]] = Field(default=None, alias="schema")
     temperature: float = 0.1
     strict: bool = False
     max_retries: int = 2
+    grounding_mode: Literal["strict", "truthful", "off"] = "off"
+    max_context_tokens: int = 4000
 
     @field_validator("temperature")
     @classmethod
@@ -170,11 +181,13 @@ class TaskOverride(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     system_prompt: Optional[str] = None
-    response_type: Optional[Literal["markdown", "json"]] = None
+    response_type: Optional[Literal["markdown", "json", "text"]] = None
     output_schema: Optional[Dict[str, Any]] = Field(default=None, alias="schema")
     temperature: Optional[float] = None
     strict: Optional[bool] = None
     max_retries: Optional[int] = None
+    grounding_mode: Optional[Literal["strict", "truthful", "off"]] = None
+    max_context_tokens: Optional[int] = None
 
     @field_validator("temperature")
     @classmethod

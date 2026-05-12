@@ -1,0 +1,83 @@
+# ResumeLab golden evaluation set.
+#
+# Each case feeds the /generate/document endpoint and asserts structural
+# properties of the returned JSON. Checked by eval_rag.py --suite resumelab.
+#
+# Required fixtures (relative to this dir):
+#   profile.json   — a CanonicalProfile JSON object (real or synthetic)
+#   jd.txt         — a real job description text
+
+- id: generate_has_sections
+  mode: canonical_only
+  tweak: ""
+  assertions:
+    - type: field_present
+      field: summary
+      description: "Generated output must include a summary field"
+    - type: field_present
+      field: skills
+      description: "Generated output must include a skills array"
+    - type: field_present
+      field: experience
+      description: "Generated output must include an experience array"
+    - type: field_type
+      field: skills
+      expected_type: list
+    - type: field_type
+      field: experience
+      expected_type: list
+    - type: min_length
+      field: experience
+      min: 1
+      description: "At least one experience entry"
+
+- id: generate_no_fabrication
+  mode: canonical_only
+  tweak: ""
+  assertions:
+    - type: grounded
+      description: "Response must be grounded (no hallucinated company names / titles)"
+
+- id: tweak_bold_tech_in_bullets
+  mode: canonical_only
+  tweak: "Highlight technical skills inside the work experience bullets using **bold**."
+  assertions:
+    - type: regex_in_field
+      field: experience
+      subfield: bullets
+      pattern: '\*\*[A-Za-z0-9+#. ]+\*\*'
+      description: "At least one experience bullet must contain a **bolded** tech term"
+
+- id: modify_existing_preserves_structure
+  mode: modify_existing
+  tweak: ""
+  assertions:
+    - type: field_present
+      field: summary
+    - type: field_present
+      field: experience
+    - type: field_present
+      field: skills
+    - type: field_type
+      field: experience
+      expected_type: list
+    - type: field_type
+      field: skills
+      expected_type: list
+
+- id: match_score_in_range
+  mode: match_only
+  tweak: ""
+  assertions:
+    - type: field_present
+      field: match_score
+    - type: numeric_range
+      field: match_score
+      min: 0
+      max: 100
+      description: "Match score must be 0–100"
+    - type: field_present
+      field: missing_keywords
+    - type: field_type
+      field: missing_keywords
+      expected_type: list

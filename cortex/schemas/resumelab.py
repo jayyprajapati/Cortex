@@ -97,6 +97,7 @@ class CanonicalProject(BaseModel):
     date_range: Optional[str] = None
     sources: List[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0, default=1.0)
+    showcase_prompt: Optional[str] = Field(default=None, max_length=800)
 
 
 class CanonicalExperience(BaseModel):
@@ -109,6 +110,7 @@ class CanonicalExperience(BaseModel):
     bullets: List[str] = Field(default_factory=list)
     sources: List[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0, default=1.0)
+    showcase_prompt: Optional[str] = Field(default=None, max_length=800)
 
 
 class CanonicalEducation(BaseModel):
@@ -195,6 +197,7 @@ class MatchRequest(BaseModel):
     canonical_profile: Dict[str, Any]
     base_resume: Optional[Dict[str, Any]] = None
     llm: Optional[LLMOverride] = None
+    user_system_prompt: Optional[str] = Field(default=None, max_length=2000)
 
 
 class MatchResponse(BaseModel):
@@ -246,7 +249,9 @@ class DocumentRequest(BaseModel):
     # Generation strategy (A3 / A4)
     mode: Literal["canonical_only", "modify_existing"] = "canonical_only"
     source_resume_content: Optional[Dict[str, Any]] = None   # sectioned_resume_source
+    original_resume_text: Optional[str] = None               # raw normalized text for verbatim preservation
     user_tweak_prompt: Optional[str] = None
+    user_system_prompt: Optional[str] = Field(default=None, max_length=2000)
     include_missing_profile_keywords: bool = True
     include_external_keywords: bool = False
     remove_irrelevant_keywords: bool = True
@@ -266,3 +271,56 @@ class DocumentResponse(BaseModel):
     removed_content: List[str]
     match_score_improved: float = Field(ge=0.0, le=100.0)
     mode: str = "canonical_only"
+
+
+# ---------------------------------------------------------------------------
+# Composition schemas (Phase 4G): Cover Letter, HR Email, Email Rewrite
+# ---------------------------------------------------------------------------
+
+class CoverLetterRequest(BaseModel):
+    app_name: str
+    user_id: str
+    job_description: str
+    canonical_profile: Dict[str, Any]
+    analysis_summary: Optional[Dict[str, Any]] = None
+    user_prompt: Optional[str] = Field(default=None, max_length=2000)
+    user_system_prompt: Optional[str] = Field(default=None, max_length=2000)
+    llm: Optional[LLMOverride] = None
+
+
+class CoverLetterResponse(BaseModel):
+    cover_letter_text: str
+    word_count: int
+
+
+class HrEmailRequest(BaseModel):
+    app_name: str
+    user_id: str
+    job_description: str
+    canonical_profile: Dict[str, Any]
+    analysis_summary: Optional[Dict[str, Any]] = None
+    recipient_name: Optional[str] = None
+    user_prompt: Optional[str] = Field(default=None, max_length=2000)
+    user_system_prompt: Optional[str] = Field(default=None, max_length=2000)
+    llm: Optional[LLMOverride] = None
+
+
+class HrEmailResponse(BaseModel):
+    subject: str
+    body: str
+    word_count: int
+
+
+class RewriteRequest(BaseModel):
+    app_name: str
+    user_id: str
+    subject: Optional[str] = None
+    body_html: Optional[str] = None
+    body_text: Optional[str] = None
+    instruction: str
+    user_system_prompt: Optional[str] = Field(default=None, max_length=2000)
+    llm: Optional[LLMOverride] = None
+
+
+class RewriteResponse(BaseModel):
+    rewritten_html: str

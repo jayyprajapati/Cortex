@@ -5,6 +5,7 @@ import time
 import uuid
 
 from app.chunking.chunker import create_chunks
+from app.chunking.entity_hints import extract_entity_hints
 from app.context import ExecutionContext
 from app.embeddings.embedder import embed_chunks, get_embedding_dimension
 from app.ingestion.loader import load_document
@@ -43,9 +44,14 @@ def _ingest_elements(ctx: ExecutionContext, elements: list, doc_id: str) -> dict
     chunks = create_chunks(elements, doc_id, ingestion_cfg)
     chunk_ms = (time.monotonic() - t_chunk) * 1000
 
+    # --- Document-level entity hints (cheap regex pass over the doc header) ---
+    entity_hints = extract_entity_hints(elements)
+
     for chunk in chunks:
         if hasattr(chunk, "source_app"):
             chunk.source_app = ctx.app_name
+        if entity_hints and hasattr(chunk, "entity_hints"):
+            chunk.entity_hints = list(entity_hints)
 
     if not chunks:
         raise ValueError(

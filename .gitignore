@@ -77,6 +77,9 @@ Thumbs.db
 # SQLite databases (common in dev)
 *.sqlite3
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 
 # Temporary files
 tmp/

@@ -16,22 +16,36 @@
     "retrieval": {
       "top_k": 10,
       "hybrid": true,
-      "alpha": 0.7
+      "alpha": 0.7,
+      "query_rewrite": true
     },
     "reranking": {
       "enabled": true,
       "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
       "top_k": 5,
-      "candidate_cap": 20
+      "candidate_cap": 20,
+      "diversity": 0.2
     },
     "generation": {
       "response_type": "markdown",
       "temperature": 0.1,
       "strict": false,
-      "max_retries": 2
+      "max_retries": 2,
+      "grounding_mode": "off"
     },
     "defaults": {
       "system_prompt": "You are DocLens, a document intelligence assistant. Answer only from the retrieved context. Format your response in clear markdown. If the answer is not present in the context, say so explicitly."
+    },
+    "default_task": "chat",
+    "tasks": {
+      "chat": {
+        "system_prompt": "You are DocLens, a document intelligence assistant. You answer questions strictly from the user's uploaded documents. You never use outside knowledge. You always cite your sources with [N] markers tied to the provided Source N blocks.",
+        "response_type": "markdown",
+        "grounding_mode": "strict",
+        "temperature": 0.0,
+        "max_retries": 1,
+        "max_context_tokens": 4000
+      }
     }
   },
   "resumelab": {
@@ -73,6 +87,9 @@
       "match": {
         "system_prompt": "You are a structured career intelligence engine. Analyze the job description against the candidate's canonical profile and current resume. Return ONLY valid JSON. You MUST distinguish: (A) keywords the candidate lacks entirely vs. (B) keywords they have in their profile but omitted from the current resume. Never guess—use the pre-computed keyword analysis provided in the context.",
         "response_type": "json",
+        "grounding_mode": "truthful",
+        "temperature": 0.0,
+        "max_context_tokens": 8000,
         "schema": {
           "type": "object",
           "required": [
@@ -109,6 +126,8 @@
       "modify_existing": {
         "system_prompt": "You are a structured career intelligence engine performing targeted optimization of an existing resume. Preserve the candidate's authentic voice and original experience. Rewrite and reorder to maximize JD relevance. Never fabricate content not present in the canonical profile. Return ONLY valid JSON.",
         "response_type": "json",
+        "grounding_mode": "truthful",
+        "max_context_tokens": 8000,
         "schema": {
           "type": "object",
           "required": ["summary", "skills", "projects", "experience", "target_keywords_used", "removed_content", "match_score_improved"],
@@ -116,7 +135,20 @@
             "summary": {"type": "string"},
             "skills": {"type": "array", "items": {"type": "string"}},
             "projects": {"type": "array"},
-            "experience": {"type": "array"},
+            "experience": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["company", "title", "bullets"],
+                "properties": {
+                  "company": {"type": "string"},
+                  "title": {"type": "string"},
+                  "date_range": {"type": ["string", "null"]},
+                  "location": {"type": ["string", "null"]},
+                  "bullets": {"type": "array", "items": {"type": "string"}}
+                }
+              }
+            },
             "target_keywords_used": {"type": "array", "items": {"type": "string"}},
             "removed_content": {"type": "array", "items": {"type": "string"}},
             "match_score_improved": {"type": "number"}
@@ -129,6 +161,8 @@
       "generate": {
         "system_prompt": "You are a structured career intelligence engine. Generate ATS-optimized resume content blocks from the candidate's canonical profile for the target role. Return ONLY valid JSON. CRITICAL: Never fabricate skills, experience, metrics, company names, titles, or dates not present in the canonical profile. Every claim must be grounded in the provided profile data.",
         "response_type": "json",
+        "grounding_mode": "truthful",
+        "max_context_tokens": 8000,
         "schema": {
           "type": "object",
           "required": [
@@ -144,7 +178,20 @@
             "summary": {"type": "string"},
             "skills": {"type": "array", "items": {"type": "string"}},
             "projects": {"type": "array"},
-            "experience": {"type": "array"},
+            "experience": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["company", "title", "bullets"],
+                "properties": {
+                  "company": {"type": "string"},
+                  "title": {"type": "string"},
+                  "date_range": {"type": ["string", "null"]},
+                  "location": {"type": ["string", "null"]},
+                  "bullets": {"type": "array", "items": {"type": "string"}}
+                }
+              }
+            },
             "target_keywords_used": {"type": "array", "items": {"type": "string"}},
             "removed_content": {"type": "array", "items": {"type": "string"}},
             "match_score_improved": {"type": "number"}
@@ -153,6 +200,35 @@
         "strict": true,
         "max_retries": 3,
         "temperature": 0.05
+      },
+      "cover_letter": {
+        "system_prompt": "You are a career-intelligence assistant writing a tailored cover letter. Ground every factual claim in the candidate's canonical profile. Match tone and terminology to the job description. Never fabricate companies, titles, metrics, or dates.",
+        "response_type": "text",
+        "grounding_mode": "truthful",
+        "temperature": 0.3,
+        "max_retries": 2
+      },
+      "hr_email": {
+        "system_prompt": "You are writing a professional outreach email to a recruiter or hiring manager. Use only facts present in the candidate's profile. Keep the email concise and compelling.",
+        "response_type": "json",
+        "grounding_mode": "truthful",
+        "temperature": 0.3,
+        "max_retries": 2,
+        "schema": {
+          "type": "object",
+          "required": ["subject", "body"],
+          "properties": {
+            "subject": {"type": "string"},
+            "body": {"type": "string"}
+          }
+        }
+      },
+      "compose_rewrite": {
+        "system_prompt": "You are an email-revision assistant. Apply the user's instruction to the source email. Preserve all factual content; alter only style, length, and tone.",
+        "response_type": "text",
+        "grounding_mode": "off",
+        "temperature": 0.4,
+        "max_retries": 1
       }
     }
   },

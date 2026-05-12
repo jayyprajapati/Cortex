@@ -155,6 +155,8 @@ def store_chunks(chunks: list, embeddings: list, user_id: str, collection_name: 
             payload["source_section"] = chunk.source_section
         if getattr(chunk, "source_app", None):
             payload["source_app"] = chunk.source_app
+        if getattr(chunk, "entity_hints", None):
+            payload["entity_hints"] = list(chunk.entity_hints)
 
         vec = vector.tolist() if hasattr(vector, "tolist") else list(vector)
         points.append(PointStruct(id=str(uuid.uuid4()), vector=vec, payload=payload))

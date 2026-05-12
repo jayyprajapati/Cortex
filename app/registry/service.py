@@ -79,12 +79,16 @@ def _resolve_effective_generation(
         temperature = task_override.temperature if task_override.temperature is not None else base.temperature
         strict = task_override.strict if task_override.strict is not None else base.strict
         max_retries = task_override.max_retries if task_override.max_retries is not None else base.max_retries
+        grounding_mode = task_override.grounding_mode if task_override.grounding_mode is not None else base.grounding_mode
+        max_context_tokens = task_override.max_context_tokens if task_override.max_context_tokens is not None else base.max_context_tokens
     else:
         response_type = base.response_type
         schema = base.output_schema
         temperature = base.temperature
         strict = base.strict
         max_retries = base.max_retries
+        grounding_mode = base.grounding_mode
+        max_context_tokens = base.max_context_tokens
 
     if prompt_override:
         system_prompt = prompt_override.strip()
@@ -96,6 +100,8 @@ def _resolve_effective_generation(
         temperature=temperature,
         strict=strict,
         max_retries=max_retries,
+        grounding_mode=grounding_mode,
+        max_context_tokens=max_context_tokens,
     )
 
 

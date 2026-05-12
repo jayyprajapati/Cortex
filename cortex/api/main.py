@@ -14,13 +14,39 @@ from pydantic import BaseModel, ValidationError
 from app.api.applications import router as applications_router
 from app.api.collections import router as collections_router
 from app.llm.factory import get_llm
-from app.pipeline.generate_pipeline import generate_answer, generate_direct
+from app.pipeline.generate_pipeline import (
+    extract_citations,
+    generate_answer,
+    generate_direct,
+)
 from app.pipeline.ingest_pipeline import ingest_document, ingest_text, resolve_doc_id
 from app.registry.service import _resolve_llm_config, build_execution_context
+from app.threads import (
+    append_message,
+    count_messages,
+    create_thread,
+    delete_thread,
+    get_recent_messages,
+    get_thread,
+    get_thread_with_messages,
+    list_threads,
+    update_summary,
+    update_title,
+)
+from app.threads.summarize import KEEP_RECENT, SUMMARIZE_AFTER, summarize_old_turns
 from app.vectorstore.qdrant_store import delete_document_vectors, delete_user_vectors
 from cortex.core.resume_extractor import extract_resume
 from cortex.core.profile_normalizer import merge_profiles
 from cortex.core.resume_optimizer import analyze_match, generate_document
+from cortex.core.composition import generate_cover_letter, generate_hr_email, rewrite_email
+from cortex.schemas.chat import (
+    ChatRequest,
+    ChatResponse,
+    ThreadDetailResponse,
+    ThreadListResponse,
+    ThreadPatchRequest,
+    ThreadSummary,
+)
 from cortex.schemas.resumelab import (
     ExtractRequest,
     ExtractResponse,
@@ -32,6 +58,12 @@ from cortex.schemas.resumelab import (
     DocumentRequest,
     DocumentResponse,
     LLMOverride,
+    CoverLetterRequest,
+    CoverLetterResponse,
+    HrEmailRequest,
+    HrEmailResponse,
+    RewriteRequest,
+    RewriteResponse,
 )
 
 _env = os.getenv("APP_ENV") or os.getenv("ENV") or os.getenv("PYTHON_ENV") or "development"
@@ -343,6 +375,217 @@ def generate_only_endpoint(payload: GenerateRequest):
         raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _auto_title(query: str) -> str:
+    words = (query or "").strip().split()
+    title = " ".join(words[:8])
+    if len(words) > 8:
+        title += "…"
+    return title or "New chat"
+
+
+def _strip_strict_answer_markers(answer: Any) -> str:
+    """Return the plain-text part of an answer for use as historical context.
+
+    The strict-mode answer is markdown with **Answer:** / **Reasoning:** / **Sources:**
+    sections. For history replay we only need the answer body — drop the rest.
+    """
+    text = str(answer) if not isinstance(answer, dict) else json.dumps(answer)
+    if "**Answer:**" in text:
+        # Take everything after **Answer:** and stop at **Reasoning:** if present
+        after = text.split("**Answer:**", 1)[1]
+        body = after.split("**Reasoning:**", 1)[0].split("**Sources:**", 1)[0]
+        return body.strip()
+    return text.strip()
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat_endpoint(payload: ChatRequest):
+    user_id = (payload.user_id or "").strip()
+    app_name = (payload.app_name or "").strip().lower()
+    query = (payload.query or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    if not app_name:
+        raise HTTPException(status_code=400, detail="app_name is required")
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    llm_override = _llm_override_from_request(payload.llm)
+
+    # Resolve or create thread, including doc-id scope
+    if payload.thread_id:
+        thread = get_thread(payload.thread_id)
+        if thread is None:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        if thread["user_id"] != user_id or thread["app_name"] != app_name:
+            raise HTTPException(status_code=403, detail="Thread does not belong to this user")
+        doc_ids = thread["doc_ids"] or payload.doc_ids
+    else:
+        doc_ids = payload.doc_ids or []
+        thread_id_new = create_thread(
+            app_name=app_name,
+            user_id=user_id,
+            doc_ids=doc_ids,
+            title=_auto_title(query),
+        )
+        thread = get_thread(thread_id_new)
+
+    # Pull recent history (oldest-first) and the rolling summary
+    history = get_recent_messages(thread["id"], n=KEEP_RECENT)
+    summary = thread.get("summary")
+
+    # Map stored messages to the lightweight {role, content} dicts the prompt builder wants
+    chat_history = [
+        {"role": m["role"], "content": m["content"]}
+        for m in history
+    ]
+
+    task = (payload.task or "chat").strip().lower()
+
+    try:
+        ctx = build_execution_context(
+            app_name=app_name,
+            user_id=user_id,
+            task=task,
+            doc_ids=doc_ids,
+            llm_override=llm_override,
+        )
+    except HTTPException:
+        raise
+
+    try:
+        result = generate_answer(ctx, query, chat_history=chat_history, summary=summary)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
+
+    answer = result.get("answer", "")
+    grounded = bool(result.get("grounded", False))
+    sources = result.get("sources", []) or []
+    meta = result.get("meta", {}) or {}
+
+    # Citations: parse [N] markers when the answer is a markdown string
+    answer_text_for_citations = (
+        answer if isinstance(answer, str) else json.dumps(answer) if isinstance(answer, dict) else str(answer)
+    )
+    citations = extract_citations(answer_text_for_citations, sources)
+
+    # Persist both turns
+    stored_assistant_content = (
+        answer if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False)
+    )
+    append_message(thread["id"], "user", query)
+    append_message(
+        thread["id"],
+        "assistant",
+        stored_assistant_content,
+        citations=citations or None,
+        grounded=grounded,
+    )
+
+    # Rolling summary: when total messages > KEEP_RECENT + SUMMARIZE_AFTER and we have
+    # unsummarized older messages, fold them into the summary.
+    total = count_messages(thread["id"])
+    summarized_up_to = int(thread.get("summary_up_to_message_idx") or 0)
+    new_old_count = max(total - KEEP_RECENT - summarized_up_to, 0)
+    if new_old_count >= SUMMARIZE_AFTER:
+        # Older messages = everything BEFORE the keep-recent window
+        all_msgs = get_thread_with_messages(thread["id"])["messages"]
+        cutoff = total - KEEP_RECENT
+        to_summarize = all_msgs[summarized_up_to:cutoff]
+        if to_summarize:
+            try:
+                llm_inst = get_llm(ctx.llm_config)
+                new_summary = summarize_old_turns(to_summarize, summary, llm_inst)
+                if new_summary:
+                    update_summary(thread["id"], new_summary, cutoff)
+            except Exception as exc:
+                # Summarization is best-effort; never block the chat response
+                import logging
+                logging.getLogger(__name__).warning("Summary update failed: %s", exc)
+
+    meta["history_used"] = len(chat_history)
+    meta["summary_in_use"] = bool(summary)
+
+    return ChatResponse(
+        thread_id=thread["id"],
+        answer=answer,
+        grounded=grounded,
+        citations=citations,
+        sources=sources,
+        meta=meta,
+    )
+
+
+@app.get("/threads", response_model=ThreadListResponse)
+def list_threads_endpoint(user_id: str, app_name: str, limit: int = 50):
+    user_id = (user_id or "").strip()
+    app_name = (app_name or "").strip().lower()
+    if not user_id or not app_name:
+        raise HTTPException(status_code=400, detail="user_id and app_name are required")
+    if not 1 <= limit <= 200:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+
+    items = list_threads(user_id=user_id, app_name=app_name, limit=limit)
+    summaries = [
+        ThreadSummary(
+            id=t["id"],
+            app_name=t["app_name"],
+            user_id=t["user_id"],
+            doc_ids=t.get("doc_ids") or [],
+            title=t.get("title"),
+            message_count=t.get("message_count", 0),
+            created_at=t["created_at"],
+            updated_at=t["updated_at"],
+        )
+        for t in items
+    ]
+    return ThreadListResponse(threads=summaries)
+
+
+@app.get("/threads/{thread_id}", response_model=ThreadDetailResponse)
+def get_thread_endpoint(thread_id: str, user_id: str):
+    user_id = (user_id or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    thread = get_thread_with_messages(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Thread does not belong to this user")
+    return ThreadDetailResponse(**thread)
+
+
+@app.delete("/threads/{thread_id}")
+def delete_thread_endpoint(thread_id: str, user_id: str):
+    user_id = (user_id or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    thread = get_thread(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Thread does not belong to this user")
+    delete_thread(thread_id)
+    return {"status": "ok", "deleted_thread_id": thread_id}
+
+
+@app.patch("/threads/{thread_id}")
+def patch_thread_endpoint(thread_id: str, user_id: str, payload: ThreadPatchRequest):
+    user_id = (user_id or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    thread = get_thread(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Thread does not belong to this user")
+    if payload.title is not None:
+        update_title(thread_id, payload.title.strip())
+    return {"status": "ok", "thread_id": thread_id}
 
 
 @app.post("/delete")
@@ -721,7 +964,9 @@ def generate_document_endpoint(payload: DocumentRequest):
             temperature=gen.temperature,
             mode=payload.mode,
             source_resume_content=payload.source_resume_content,
+            original_resume_text=payload.original_resume_text,
             user_tweak_prompt=payload.user_tweak_prompt,
+            user_system_prompt=payload.user_system_prompt,
             include_missing_profile_keywords=payload.include_missing_profile_keywords,
             include_external_keywords=payload.include_external_keywords,
             remove_irrelevant_keywords=payload.remove_irrelevant_keywords,
@@ -739,3 +984,128 @@ def generate_document_endpoint(payload: DocumentRequest):
             status_code=500,
             detail=f"Document generation produced invalid response shape: {_sanitize(exc.errors())}",
         ) from exc
+
+
+@app.post("/cover-letter", response_model=CoverLetterResponse)
+def cover_letter_endpoint(payload: CoverLetterRequest):
+    """
+    POST /cover-letter
+
+    Generate a tailored cover letter from the candidate's canonical profile.
+    Grounded — no fabricated claims. Respects user style guidance from settings.
+    """
+    try:
+        llm_ov = _llm_override_from_request(payload.llm)
+        ctx = build_execution_context(
+            app_name=payload.app_name,
+            user_id=payload.user_id,
+            task="cover_letter",
+            llm_override=llm_ov,
+        )
+    except HTTPException:
+        raise
+
+    gen = ctx.effective_generation
+
+    try:
+        result = generate_cover_letter(
+            job_description=payload.job_description,
+            canonical_profile=payload.canonical_profile,
+            llm_config=ctx.llm_config,
+            system_prompt=gen.system_prompt,
+            analysis_summary=payload.analysis_summary,
+            user_prompt=payload.user_prompt,
+            user_system_prompt=payload.user_system_prompt,
+            max_retries=gen.max_retries,
+            temperature=gen.temperature,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return CoverLetterResponse(**result)
+
+
+@app.post("/hr-email", response_model=HrEmailResponse)
+def hr_email_endpoint(payload: HrEmailRequest):
+    """
+    POST /hr-email
+
+    Generate a structured recruiter/HR outreach email from the candidate's canonical profile.
+    Returns subject + body as JSON. Grounded — no fabricated claims.
+    """
+    try:
+        llm_ov = _llm_override_from_request(payload.llm)
+        ctx = build_execution_context(
+            app_name=payload.app_name,
+            user_id=payload.user_id,
+            task="hr_email",
+            llm_override=llm_ov,
+        )
+    except HTTPException:
+        raise
+
+    gen = ctx.effective_generation
+
+    try:
+        result = generate_hr_email(
+            job_description=payload.job_description,
+            canonical_profile=payload.canonical_profile,
+            llm_config=ctx.llm_config,
+            system_prompt=gen.system_prompt,
+            analysis_summary=payload.analysis_summary,
+            recipient_name=payload.recipient_name,
+            user_prompt=payload.user_prompt,
+            user_system_prompt=payload.user_system_prompt,
+            max_retries=gen.max_retries,
+            temperature=gen.temperature,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return HrEmailResponse(**result)
+
+
+@app.post("/compose/rewrite", response_model=RewriteResponse)
+def compose_rewrite_endpoint(payload: RewriteRequest):
+    """
+    POST /compose/rewrite
+
+    Rewrite an email according to a user instruction (make concise, more formal, etc.).
+    Preserves facts; alters only style, length, and tone.
+    Returns rewritten content as HTML.
+    """
+    try:
+        llm_ov = _llm_override_from_request(payload.llm)
+        ctx = build_execution_context(
+            app_name=payload.app_name,
+            user_id=payload.user_id,
+            task="compose_rewrite",
+            llm_override=llm_ov,
+        )
+    except HTTPException:
+        raise
+
+    gen = ctx.effective_generation
+
+    try:
+        result = rewrite_email(
+            instruction=payload.instruction,
+            llm_config=ctx.llm_config,
+            system_prompt=gen.system_prompt,
+            body_html=payload.body_html,
+            body_text=payload.body_text,
+            subject=payload.subject,
+            user_system_prompt=payload.user_system_prompt,
+            max_retries=gen.max_retries,
+            temperature=gen.temperature,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return RewriteResponse(**result)

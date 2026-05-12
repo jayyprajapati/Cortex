@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 if TYPE_CHECKING:
     from app.registry.models import ApplicationConfig
+
+
+GroundingMode = Literal["strict", "truthful", "off"]
 
 
 @dataclass
@@ -26,6 +29,8 @@ class EffectiveGenerationConfig:
     temperature: float
     strict: bool
     max_retries: int
+    grounding_mode: GroundingMode = "off"
+    max_context_tokens: int = 4000
 
 
 @dataclass
