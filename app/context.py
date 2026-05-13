@@ -5,6 +5,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 if TYPE_CHECKING:
     from app.registry.models import ApplicationConfig
+    from app.ingestion.loaders.base import BaseLoader
+    from app.chunking.base import BaseChunker
+    from app.embeddings.base import BaseEmbedder
+    from app.vectorstore.base import BaseVectorStore
+    from app.reranker.base import BaseReranker
 
 
 GroundingMode = Literal["strict", "truthful", "off"]
@@ -34,6 +39,15 @@ class EffectiveGenerationConfig:
 
 
 @dataclass
+class ResolvedComponents:
+    loader: "BaseLoader"
+    chunker: "BaseChunker"
+    embedder: "BaseEmbedder"
+    reranker: Optional["BaseReranker"]
+    vector_store: "BaseVectorStore"
+
+
+@dataclass
 class ExecutionContext:
     """
     Carries fully resolved configuration through every pipeline stage.
@@ -46,6 +60,7 @@ class ExecutionContext:
     registry: "ApplicationConfig"
     llm_config: LLMConfig
     effective_generation: EffectiveGenerationConfig
+    components: Optional[ResolvedComponents] = None   # populated by build_execution_context
     doc_ids: Optional[List[str]] = None
     task: Optional[str] = None
     prompt_override: Optional[str] = None

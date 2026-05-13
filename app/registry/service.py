@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
-from app.context import EffectiveGenerationConfig, ExecutionContext, LLMConfig
+from app.context import EffectiveGenerationConfig, ExecutionContext, LLMConfig, ResolvedComponents
 from app.registry.models import ApplicationConfig, TaskOverride
 from app.registry.store import get_app
 
@@ -105,6 +105,60 @@ def _resolve_effective_generation(
     )
 
 
+def _resolve_components(config: ApplicationConfig) -> ResolvedComponents:
+    from app.ingestion.loaders.factory import get_loader
+    from app.chunking.chunker import _resolve_chunker
+    from app.embeddings.factory import get_embedder
+    from app.vectorstore.factory import get_vector_store
+    from app.reranker.factory import get_reranker
+
+    loader = get_loader(
+        provider=config.loader.provider,
+        options=config.loader.provider_options,
+    )
+
+    chunker = _resolve_chunker(config.chunking)
+
+    embedder_opts = {
+        "model": config.embedding.model,
+        "batch_size": config.embedding.batch_size,
+        "normalize": config.embedding.normalize,
+        "sparse_model": config.embedding.sparse_model,
+        **(config.embedding.provider_options or {}),
+    }
+    if config.embedding.dimension is not None:
+        embedder_opts["dimension"] = config.embedding.dimension
+    embedder = get_embedder(
+        provider=config.embedding.provider,
+        options=embedder_opts,
+    )
+
+    vector_store = get_vector_store(
+        provider=config.vector_store.provider,
+        options=config.vector_store.provider_options,
+    )
+
+    reranker = None
+    if config.reranking.enabled:
+        reranker_opts = {
+            "model": config.reranking.model,
+            "diversity": config.reranking.diversity,
+            **(config.reranking.provider_options or {}),
+        }
+        reranker = get_reranker(
+            provider=config.reranking.provider,
+            options=reranker_opts,
+        )
+
+    return ResolvedComponents(
+        loader=loader,
+        chunker=chunker,
+        embedder=embedder,
+        reranker=reranker,
+        vector_store=vector_store,
+    )
+
+
 def build_execution_context(
     app_name: str,
     user_id: str,
@@ -135,6 +189,7 @@ def build_execution_context(
 
     llm_config = _resolve_llm_config(llm_override)
     effective_gen = _resolve_effective_generation(config, normalized_task, prompt_override)
+    components = _resolve_components(config)
 
     clean_doc_ids: Optional[List[str]] = None
     if doc_ids:
@@ -146,6 +201,7 @@ def build_execution_context(
         registry=config,
         llm_config=llm_config,
         effective_generation=effective_gen,
+        components=components,
         doc_ids=clean_doc_ids,
         task=normalized_task,
         prompt_override=prompt_override,
