@@ -9,8 +9,10 @@ class Chunk:
     page: Optional[int]
     chunk_id: int
     section: Optional[str] = None
-    hierarchy: Optional[str] = None
+    hierarchy: Optional[List[str]] = None
     token_count: Optional[int] = None
+    prev_chunk_id: Optional[int] = None
+    next_chunk_id: Optional[int] = None
     # Resume-canonical fields — populated by ResumeCanonicalStrategy and ingest pipeline.
     # Ignored by all other strategies; backward-compatible additions.
     canonical_type: Optional[str] = None   # skill | experience | project | education | certification | summary | contact | misc

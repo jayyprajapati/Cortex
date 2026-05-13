@@ -45,6 +45,21 @@ class BaseVectorStore(ABC):
     ) -> None:
         ...
 
+    def upsert_batch(
+        self,
+        collection: str,
+        points: List[Dict[str, Any]],
+    ) -> None:
+        """Batch upsert. Default falls back to individual upserts; providers should override."""
+        for p in points:
+            self.upsert(
+                collection=collection,
+                point_id=p["point_id"],
+                vector=p["vector"],
+                sparse_vector=p["sparse_vector"],
+                payload=p["payload"],
+            )
+
     @abstractmethod
     def search_dense(
         self,

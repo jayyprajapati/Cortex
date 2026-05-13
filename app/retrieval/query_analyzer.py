@@ -8,14 +8,16 @@ from app.context import ExecutionContext
 
 logger = logging.getLogger(__name__)
 
-_ANALYZER_PROMPT = """Analyze this search query and return ONLY valid JSON.
+_ANALYZER_PROMPT = """Analyze this search query for a RAG (Retrieval-Augmented Generation) system and return ONLY valid JSON.
+
+Context: The user is querying their own uploaded documents. References like "this document", "the file", "the resume", "it", "the one I uploaded", "the document" always refer to the user's uploaded documents and are NEVER ambiguous — do NOT set is_ambiguous=true for these.
 
 Query: {query}
 {history_context}
 
 Return JSON with exactly these fields:
 {{
-  "is_ambiguous": <bool — true if query is too vague to search without context>,
+  "is_ambiguous": <bool — true ONLY if the query has absolutely no searchable intent, like a single random word or a pure meta-question about the system itself>,
   "clarifying_question": <str or null — if ambiguous, a specific clarifying question>,
   "entities": <list of str — named entities in the query>,
   "query_type": <"factual" | "conceptual" | "navigational" | "comparison">,
@@ -23,7 +25,8 @@ Return JSON with exactly these fields:
 }}
 
 Rules:
-- Only set is_ambiguous=true for truly ambiguous queries (pronouns without referent, "the second one", etc.)
+- Document-reference queries ("what is this about?", "summarize it", "what does the file say?") are NOT ambiguous — the document is the user's upload
+- Only set is_ambiguous=true for queries that have zero searchable content (e.g. a single stop-word, or "hello")
 - rewrites should be genuinely different phrasings, not paraphrases
 - Return ONLY the JSON object, no prose"""
 

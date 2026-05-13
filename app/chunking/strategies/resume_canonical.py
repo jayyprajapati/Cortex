@@ -92,22 +92,38 @@ class ResumeCanonicalStrategy(ChunkingStrategy):
         chunk_id = 0
 
         for section_heading, ctype, page, lines in sections:
-            for sc in self._split_section(lines, section_heading):
+            # Ensure section is never None — pre-content always uses "CONTACT"
+            effective_heading = section_heading or "CONTACT"
+            effective_ctype = ctype or "contact"
+            section_chunks: List[Chunk] = []
+            for sc in self._split_section(lines, effective_heading):
                 if sc["tokens"] < self.config.min_tokens:
                     continue
-                chunks.append(
+                section_chunks.append(
                     Chunk(
                         text=sc["text"],
                         doc_id=doc_id,
                         page=page,
                         chunk_id=chunk_id,
-                        section=section_heading,
+                        section=effective_heading,
                         token_count=sc["tokens"],
-                        canonical_type=ctype,
-                        source_section=section_heading,
+                        canonical_type=effective_ctype,
+                        source_section=effective_heading,
                     )
                 )
                 chunk_id += 1
+
+            # Merge small CONTACT/HEADER chunks into the previous chunk (contact info
+            # is typically very short and better kept together with the next section)
+            if (section_chunks and effective_heading in ("CONTACT", "HEADER")
+                    and section_chunks[-1].token_count < self.config.min_tokens
+                    and chunks):
+                prev = chunks[-1]
+                prev.text = prev.text + "\n\n" + section_chunks[-1].text
+                prev.token_count = (prev.token_count or 0) + (section_chunks[-1].token_count or 0)
+                section_chunks = section_chunks[:-1]
+
+            chunks.extend(section_chunks)
 
         return chunks
 
@@ -139,8 +155,8 @@ class ResumeCanonicalStrategy(ChunkingStrategy):
                 current_lines = []
             else:
                 if current_heading is None:
-                    current_heading = "HEADER"
-                    current_ctype = "misc"
+                    current_heading = "CONTACT"
+                    current_ctype = "contact"
                     current_page = page
                 current_lines.append(text)
 

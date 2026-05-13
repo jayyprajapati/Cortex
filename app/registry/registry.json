@@ -41,7 +41,7 @@
       "grounding_mode": "off"
     },
     "conversation": {
-      "clarification_policy": "balanced",
+      "clarification_policy": "never",
       "max_history_turns": 10,
       "use_query_analyzer": true
     },

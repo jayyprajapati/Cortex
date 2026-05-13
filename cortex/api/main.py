@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from typing import Any, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Request
+
+logger = logging.getLogger(__name__)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -18,6 +21,7 @@ from app.pipeline.generate_pipeline import (
     extract_citations,
     generate_answer,
     generate_direct,
+    stream_answer,
 )
 from app.pipeline.ingest_pipeline import ingest_document, ingest_text, resolve_doc_id
 from app.registry.service import _resolve_llm_config, build_execution_context
@@ -135,16 +139,6 @@ class LLMOptions(BaseModel):
     model: Optional[str] = None
 
 
-class QueryRequest(BaseModel):
-    app_name: str
-    user_id: str
-    query: str
-    task: Optional[str] = None
-    doc_ids: Optional[List[str]] = None
-    llm: Optional[LLMOptions] = None
-    prompt_override: Optional[str] = None
-
-
 class IngestRequest(BaseModel):
     app_name: str
     user_id: str
@@ -173,6 +167,13 @@ class DeleteRequest(BaseModel):
 class DeleteAllRequest(BaseModel):
     app_name: str
     user_id: str
+
+
+class ReindexRequest(BaseModel):
+    app_name: str
+    user_id: str
+    source_dir: str
+    drop_first: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -316,35 +317,14 @@ async def ingest_endpoint(request: Request):
     return {"status": "success", **result}
 
 
-@app.post("/query")
-def query_endpoint(payload: QueryRequest):
-    try:
-        llm_override = None
-        if payload.llm:
-            llm_override = {
-                "provider": payload.llm.provider,
-                "model": payload.llm.model,
-                "api_key": payload.llm.api_key,
-            }
-
-        ctx = build_execution_context(
-            app_name=payload.app_name,
-            user_id=payload.user_id,
-            task=payload.task,
-            doc_ids=payload.doc_ids,
-            llm_override=llm_override,
-            prompt_override=payload.prompt_override,
-        )
-        return generate_answer(ctx, payload.query)
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
 @app.post("/generate")
-def generate_only_endpoint(payload: GenerateRequest):
+async def generate_only_endpoint(request: Request, stream: bool = False):
+    try:
+        body = await request.json()
+        payload = GenerateRequest(**body)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
     try:
         llm_override = None
         if payload.llm:
@@ -369,12 +349,35 @@ def generate_only_endpoint(payload: GenerateRequest):
             llm_override=llm_override,
             prompt_override=payload.prompt_override,
         )
-        return generate_direct(ctx, query=payload.query or "", context=composed_context)
-
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not stream:
+        # Original non-streaming behavior
+        try:
+            return generate_direct(ctx, query=payload.query or "", context=composed_context)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        # SSE streaming path
+        from app.streaming.sse import make_sse_response, meta_event, delta_event, done_event, error_event
+
+        async def _gen():
+            yield meta_event({"type": "generate"})
+            try:
+                result = generate_direct(ctx, query=payload.query or "", context=composed_context)
+                answer = result.get("answer", "")
+                answer_text = answer if isinstance(answer, str) else json.dumps(answer)
+                yield delta_event(answer_text)
+                yield done_event({"grounded": result.get("grounded", False)})
+            except Exception as exc:
+                yield error_event(str(exc))
+
+        return make_sse_response(_gen())
 
 
 def _auto_title(query: str) -> str:
@@ -385,23 +388,20 @@ def _auto_title(query: str) -> str:
     return title or "New chat"
 
 
-def _strip_strict_answer_markers(answer: Any) -> str:
-    """Return the plain-text part of an answer for use as historical context.
-
-    The strict-mode answer is markdown with **Answer:** / **Reasoning:** / **Sources:**
-    sections. For history replay we only need the answer body — drop the rest.
+@app.post("/chat")
+async def chat_endpoint(request: Request, stream: bool = True):
     """
-    text = str(answer) if not isinstance(answer, dict) else json.dumps(answer)
-    if "**Answer:**" in text:
-        # Take everything after **Answer:** and stop at **Reasoning:** if present
-        after = text.split("**Answer:**", 1)[1]
-        body = after.split("**Reasoning:**", 1)[0].split("**Sources:**", 1)[0]
-        return body.strip()
-    return text.strip()
+    POST /chat
 
+    Streaming (default): returns SSE event stream.
+    Non-streaming (?stream=false): returns JSON ChatResponse.
+    """
+    try:
+        body = await request.json()
+        payload = ChatRequest(**body)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
-@app.post("/chat", response_model=ChatResponse)
-def chat_endpoint(payload: ChatRequest):
     user_id = (payload.user_id or "").strip()
     app_name = (payload.app_name or "").strip().lower()
     query = (payload.query or "").strip()
@@ -414,7 +414,7 @@ def chat_endpoint(payload: ChatRequest):
 
     llm_override = _llm_override_from_request(payload.llm)
 
-    # Resolve or create thread, including doc-id scope
+    # Resolve or create thread
     if payload.thread_id:
         thread = get_thread(payload.thread_id)
         if thread is None:
@@ -432,16 +432,16 @@ def chat_endpoint(payload: ChatRequest):
         )
         thread = get_thread(thread_id_new)
 
-    # Pull recent history (oldest-first) and the rolling summary
+    # Check clarification state
+    from app.conversation.state import get_clarification_pending, get_clarification_context, clear_clarification_pending
+    clarification_reply = False
+    if get_clarification_pending(thread):
+        clarification_reply = True
+        clear_clarification_pending(thread["id"])
+
     history = get_recent_messages(thread["id"], n=KEEP_RECENT)
     summary = thread.get("summary")
-
-    # Map stored messages to the lightweight {role, content} dicts the prompt builder wants
-    chat_history = [
-        {"role": m["role"], "content": m["content"]}
-        for m in history
-    ]
-
+    chat_history = [{"role": m["role"], "content": m["content"]} for m in history]
     task = (payload.task or "chat").strip().lower()
 
     try:
@@ -455,69 +455,152 @@ def chat_endpoint(payload: ChatRequest):
     except HTTPException:
         raise
 
-    try:
-        result = generate_answer(ctx, query, chat_history=chat_history, summary=summary)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
+    if stream:
+        # SSE streaming path
+        from app.streaming.sse import make_sse_response, error_event
 
-    answer = result.get("answer", "")
-    grounded = bool(result.get("grounded", False))
-    sources = result.get("sources", []) or []
-    meta = result.get("meta", {}) or {}
-
-    # Citations: parse [N] markers when the answer is a markdown string
-    answer_text_for_citations = (
-        answer if isinstance(answer, str) else json.dumps(answer) if isinstance(answer, dict) else str(answer)
-    )
-    citations = extract_citations(answer_text_for_citations, sources)
-
-    # Persist both turns
-    stored_assistant_content = (
-        answer if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False)
-    )
-    append_message(thread["id"], "user", query)
-    append_message(
-        thread["id"],
-        "assistant",
-        stored_assistant_content,
-        citations=citations or None,
-        grounded=grounded,
-    )
-
-    # Rolling summary: when total messages > KEEP_RECENT + SUMMARIZE_AFTER and we have
-    # unsummarized older messages, fold them into the summary.
-    total = count_messages(thread["id"])
-    summarized_up_to = int(thread.get("summary_up_to_message_idx") or 0)
-    new_old_count = max(total - KEEP_RECENT - summarized_up_to, 0)
-    if new_old_count >= SUMMARIZE_AFTER:
-        # Older messages = everything BEFORE the keep-recent window
-        all_msgs = get_thread_with_messages(thread["id"])["messages"]
-        cutoff = total - KEEP_RECENT
-        to_summarize = all_msgs[summarized_up_to:cutoff]
-        if to_summarize:
+        async def _sse_generator():
+            full_answer_parts = []
+            citations_list = []
+            event_type_received = None
+            was_clarification = False
             try:
-                llm_inst = get_llm(ctx.llm_config)
-                new_summary = summarize_old_turns(to_summarize, summary, llm_inst)
-                if new_summary:
-                    update_summary(thread["id"], new_summary, cutoff)
+                async for event_str in stream_answer(
+                    ctx=ctx,
+                    query=query,
+                    chat_history=chat_history,
+                    summary=summary,
+                    clarification_reply=clarification_reply,
+                ):
+                    yield event_str
+                    # Parse emitted events to extract answer + citations for thread storage
+                    import json as _json
+                    try:
+                        # SSE events are "event: TYPE\ndata: JSON\n\n"
+                        for line in event_str.split("\n"):
+                            if line.startswith("event: "):
+                                event_type_received = line[7:].strip()
+                            elif line.startswith("data: "):
+                                data = _json.loads(line[6:])
+                                if event_type_received == "delta":
+                                    full_answer_parts.append(data.get("text", ""))
+                                elif event_type_received == "clarification":
+                                    full_answer_parts.append(data.get("text", ""))
+                                    was_clarification = True
+                                elif event_type_received == "citations":
+                                    citations_list = data.get("citations", [])
+                    except Exception:
+                        pass
             except Exception as exc:
-                # Summarization is best-effort; never block the chat response
-                import logging
-                logging.getLogger(__name__).warning("Summary update failed: %s", exc)
+                yield error_event(str(exc), code="stream_error")
 
-    meta["history_used"] = len(chat_history)
-    meta["summary_in_use"] = bool(summary)
+            # Persist thread messages after stream completes
+            try:
+                full_answer = "".join(full_answer_parts)
+                append_message(thread["id"], "user", query)
+                append_message(
+                    thread["id"],
+                    "assistant",
+                    full_answer,
+                    citations=citations_list or None,
+                    grounded=False,
+                )
+                if was_clarification:
+                    from app.conversation.state import mark_clarification_pending
+                    from app.conversation.clarification import build_clarification_context
+                    mark_clarification_pending(thread["id"], build_clarification_context({}, query))
+                # Rolling summarization (best-effort)
+                total = count_messages(thread["id"])
+                summarized_up_to = int(thread.get("summary_up_to_message_idx") or 0)
+                from app.conversation.history import should_summarize
+                if should_summarize(total, summarized_up_to):
+                    all_msgs = get_thread_with_messages(thread["id"])["messages"]
+                    cutoff = total - KEEP_RECENT
+                    to_summarize = all_msgs[summarized_up_to:cutoff]
+                    if to_summarize:
+                        try:
+                            llm_inst = get_llm(ctx.llm_config)
+                            new_summary = summarize_old_turns(to_summarize, summary, llm_inst)
+                            if new_summary:
+                                update_summary(thread["id"], new_summary, cutoff)
+                        except Exception:
+                            pass
+            except Exception as exc:
+                logger.warning("Post-stream thread persistence failed: %s", exc)
 
-    return ChatResponse(
-        thread_id=thread["id"],
-        answer=answer,
-        grounded=grounded,
-        citations=citations,
-        sources=sources,
-        meta=meta,
-    )
+        return make_sse_response(_sse_generator())
+
+    else:
+        # Non-streaming JSON path (legacy)
+        try:
+            result = generate_answer(
+                ctx, query,
+                chat_history=chat_history,
+                summary=summary,
+                clarification_reply=clarification_reply,
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
+
+        answer = result.get("answer", "")
+        grounded = bool(result.get("grounded", False))
+        sources = result.get("sources", []) or []
+        meta = result.get("meta", {}) or {}
+
+        answer_text_for_citations = (
+            answer if isinstance(answer, str)
+            else json.dumps(answer) if isinstance(answer, dict)
+            else str(answer)
+        )
+        citations = extract_citations(answer_text_for_citations, sources)
+
+        stored_assistant_content = (
+            answer if isinstance(answer, str)
+            else json.dumps(answer, ensure_ascii=False)
+        )
+        append_message(thread["id"], "user", query)
+        append_message(
+            thread["id"],
+            "assistant",
+            stored_assistant_content,
+            citations=citations or None,
+            grounded=grounded,
+        )
+        if result.get("needs_clarification"):
+            from app.conversation.state import mark_clarification_pending
+            from app.conversation.clarification import build_clarification_context
+            mark_clarification_pending(thread["id"], build_clarification_context({}, query))
+
+        # Summarization
+        total = count_messages(thread["id"])
+        summarized_up_to = int(thread.get("summary_up_to_message_idx") or 0)
+        new_old_count = max(total - KEEP_RECENT - summarized_up_to, 0)
+        if new_old_count >= SUMMARIZE_AFTER:
+            all_msgs = get_thread_with_messages(thread["id"])["messages"]
+            cutoff = total - KEEP_RECENT
+            to_summarize = all_msgs[summarized_up_to:cutoff]
+            if to_summarize:
+                try:
+                    llm_inst = get_llm(ctx.llm_config)
+                    new_summary = summarize_old_turns(to_summarize, summary, llm_inst)
+                    if new_summary:
+                        update_summary(thread["id"], new_summary, cutoff)
+                except Exception as exc:
+                    logger.warning("Summary update failed: %s", exc)
+
+        meta["history_used"] = len(chat_history)
+        meta["summary_in_use"] = bool(summary)
+
+        return ChatResponse(
+            thread_id=thread["id"],
+            answer=answer,
+            grounded=grounded,
+            citations=citations,
+            sources=sources,
+            meta=meta,
+        )
 
 
 @app.get("/threads", response_model=ThreadListResponse)
@@ -592,13 +675,9 @@ def patch_thread_endpoint(thread_id: str, user_id: str, payload: ThreadPatchRequ
 def delete_document_endpoint(payload: DeleteRequest):
     try:
         ctx = build_execution_context(app_name=payload.app_name, user_id=payload.user_id)
-        deleted = delete_document_vectors(ctx.collection, payload.user_id, payload.doc_id)
+        deleted = ctx.components.vector_store.delete_by_doc(ctx.collection, payload.user_id, payload.doc_id)
     except HTTPException:
         raise
-    except ValueError as exc:
-        detail = str(exc)
-        status = 404 if "No matching vectors" in detail else 400
-        raise HTTPException(status_code=status, detail=detail) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -615,13 +694,9 @@ def delete_document_endpoint(payload: DeleteRequest):
 def delete_all_documents_endpoint(payload: DeleteAllRequest):
     try:
         ctx = build_execution_context(app_name=payload.app_name, user_id=payload.user_id)
-        deleted = delete_user_vectors(ctx.collection, payload.user_id)
+        deleted = ctx.components.vector_store.delete_by_user(ctx.collection, payload.user_id)
     except HTTPException:
         raise
-    except ValueError as exc:
-        detail = str(exc)
-        status = 404 if "No matching vectors" in detail else 400
-        raise HTTPException(status_code=status, detail=detail) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -1109,3 +1184,28 @@ def compose_rewrite_endpoint(payload: RewriteRequest):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return RewriteResponse(**result)
+
+
+@app.post("/admin/reindex")
+def admin_reindex_endpoint(payload: ReindexRequest):
+    """
+    POST /admin/reindex
+
+    Drop the app's collection and re-ingest all supported files from source_dir.
+    Use drop_first=true (default) for a clean reindex.
+    """
+    try:
+        from app.admin.reindex import reindex_app
+        result = reindex_app(
+            app_name=payload.app_name,
+            user_id=payload.user_id,
+            source_dir=payload.source_dir,
+            drop_first=payload.drop_first,
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return result

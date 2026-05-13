@@ -49,7 +49,20 @@ def run_retrieval(
     conv_cfg = ctx.registry.conversation
     policy = conv_cfg.clarification_policy
 
-    # Step 1: Query analysis
+    # Step 1: Resolve components and verify user has documents before any analysis.
+    # Doing this first avoids firing clarification when the real answer is "no docs uploaded".
+    vs = ctx.components.vector_store if ctx.components else None
+    embedder = ctx.components.embedder if ctx.components else None
+
+    if vs is None or embedder is None:
+        logger.warning("No vector store or embedder in ctx.components — returning empty result")
+        return RetrievalResult()
+
+    user_docs = vs.list_docs(ctx.collection, ctx.user_id)
+    if not user_docs:
+        return RetrievalResult()
+
+    # Step 2: Query analysis (only runs if user has documents worth searching)
     analyzer_result: Dict[str, Any] = {"is_ambiguous": False, "clarifying_question": None, "rewrites": [], "entities": [], "query_type": "factual"}
     if conv_cfg.use_query_analyzer and not clarification_reply:
         from app.retrieval.query_analyzer import analyze_query
@@ -57,7 +70,7 @@ def run_retrieval(
 
     rewrites = [r for r in (analyzer_result.get("rewrites") or []) if r and r.strip() and r != query]
 
-    # Step 2: Clarification gate
+    # Step 3: Clarification gate (only fires when policy allows and query is genuinely unsearchable)
     if (
         analyzer_result.get("is_ambiguous")
         and policy != "never"
@@ -70,29 +83,13 @@ def run_retrieval(
             is_vague=True,
         )
 
-    # Step 3: Query expansion
+    # Step 4: Query expansion
     queries = [query] + rewrites
     if retrieval_cfg.hyde and not rewrites:
         from app.retrieval.hyde import generate_hypothetical_doc
         hyde_text = generate_hypothetical_doc(ctx, query)
         if hyde_text and hyde_text != query:
             queries.append(hyde_text)
-
-    # Step 4: Vector search
-    vs = ctx.components.vector_store if ctx.components else None
-    embedder = ctx.components.embedder if ctx.components else None
-
-    if vs is None or embedder is None:
-        logger.warning("No vector store or embedder in ctx.components — returning empty result")
-        return RetrievalResult()
-
-    # Check if user has any documents
-    user_docs = vs.list_docs(ctx.collection, ctx.user_id)
-    if not user_docs:
-        return RetrievalResult(
-            needs_clarification=False,
-            is_vague=False,
-        )
 
     requested_doc_ids = ctx.doc_ids or None
     candidate_cap = retrieval_cfg.top_k * 3 if not ctx.registry.reranking.enabled else ctx.registry.reranking.candidate_cap

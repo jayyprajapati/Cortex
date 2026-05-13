@@ -124,24 +124,39 @@ class QdrantVectorStore(BaseVectorStore):
         sparse_vector: Optional[Dict[str, Any]],
         payload: ChunkPayload,
     ) -> None:
+        self.upsert_batch(collection, [{"point_id": point_id, "vector": vector, "sparse_vector": sparse_vector, "payload": payload}])
+
+    def upsert_batch(
+        self,
+        collection: str,
+        points: List[Dict[str, Any]],
+        batch_size: int = 100,
+    ) -> None:
         from qdrant_client.models import PointStruct, SparseVector
 
         client = self._get_client()
-        payload_dict = payload.model_dump()
 
-        if sparse_vector is not None:
-            vectors = {
-                "dense": vector,
-                "sparse": SparseVector(
-                    indices=sparse_vector["indices"],
-                    values=sparse_vector["values"],
-                ),
-            }
-            point = PointStruct(id=point_id, vector=vectors, payload=payload_dict)
-        else:
-            point = PointStruct(id=point_id, vector=vector, payload=payload_dict)
+        qdrant_points = []
+        for p in points:
+            vector = p["vector"]
+            sparse_vector = p["sparse_vector"]
+            payload_dict = p["payload"].model_dump()
 
-        client.upsert(collection_name=collection, points=[point])
+            if sparse_vector is not None:
+                vectors = {
+                    "dense": vector,
+                    "sparse": SparseVector(
+                        indices=sparse_vector["indices"],
+                        values=sparse_vector["values"],
+                    ),
+                }
+                point = PointStruct(id=p["point_id"], vector=vectors, payload=payload_dict)
+            else:
+                point = PointStruct(id=p["point_id"], vector=vector, payload=payload_dict)
+            qdrant_points.append(point)
+
+        for i in range(0, len(qdrant_points), batch_size):
+            client.upsert(collection_name=collection, points=qdrant_points[i:i + batch_size])
 
     def search_dense(
         self,
@@ -258,12 +273,17 @@ class QdrantVectorStore(BaseVectorStore):
             ]
         )
 
-        count_result = client.count(collection_name=collection, count_filter=filter_obj)
-        deleted_count = count_result.count
-
-        client.delete(collection_name=collection, points_selector=filter_obj)
-
-        return deleted_count
+        try:
+            count_result = client.count(collection_name=collection, count_filter=filter_obj)
+            deleted_count = count_result.count
+            if deleted_count > 0:
+                client.delete(collection_name=collection, points_selector=filter_obj)
+            return deleted_count
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "not found" in msg or "doesn't exist" in msg or "status_code=404" in msg:
+                return 0
+            raise
 
     def delete_by_user(self, collection: str, user_id: str) -> int:
         from qdrant_client.models import Filter, FieldCondition, MatchValue
@@ -273,12 +293,17 @@ class QdrantVectorStore(BaseVectorStore):
             must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
         )
 
-        count_result = client.count(collection_name=collection, count_filter=filter_obj)
-        deleted_count = count_result.count
-
-        client.delete(collection_name=collection, points_selector=filter_obj)
-
-        return deleted_count
+        try:
+            count_result = client.count(collection_name=collection, count_filter=filter_obj)
+            deleted_count = count_result.count
+            if deleted_count > 0:
+                client.delete(collection_name=collection, points_selector=filter_obj)
+            return deleted_count
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "not found" in msg or "doesn't exist" in msg or "status_code=404" in msg:
+                return 0
+            raise
 
     def list_docs(self, collection: str, user_id: str) -> List[str]:
         from qdrant_client.models import Filter, FieldCondition, MatchValue

@@ -99,13 +99,12 @@ def _ingest_elements(ctx: ExecutionContext, elements, doc_id: str) -> dict:
 
     # --- Store ---
     t_store = time.monotonic()
-    for i, (chunk, dense_vec, sparse_vec) in enumerate(zip(chunks, dense_vectors, sparse_vectors)):
-        # Build section_path: use hierarchy if available, else fallback
+    batch_points = []
+    for chunk, dense_vec, sparse_vec in zip(chunks, dense_vectors, sparse_vectors):
         section_path = None
         if hasattr(chunk, "hierarchy") and chunk.hierarchy and isinstance(chunk.hierarchy, list):
             section_path = [str(s) for s in chunk.hierarchy if s]
         if not section_path:
-            # Fallback: use section field
             section_str = getattr(chunk, "section", None) or ""
             section_path = [section_str] if section_str else ["_root"]
 
@@ -124,15 +123,14 @@ def _ingest_elements(ctx: ExecutionContext, elements, doc_id: str) -> dict:
             canonical_type=getattr(chunk, "canonical_type", None),
             source_app=getattr(chunk, "source_app", None),
         )
+        batch_points.append({
+            "point_id": str(uuid.uuid4()),
+            "vector": list(dense_vec) if hasattr(dense_vec, "__iter__") else dense_vec,
+            "sparse_vector": sparse_vec,
+            "payload": payload,
+        })
 
-        point_id = str(uuid.uuid4())
-        vs.upsert(
-            collection=collection,
-            point_id=point_id,
-            vector=list(dense_vec) if hasattr(dense_vec, "__iter__") else dense_vec,
-            sparse_vector=sparse_vec,
-            payload=payload,
-        )
+    vs.upsert_batch(collection=collection, points=batch_points)
     store_ms = (time.monotonic() - t_store) * 1000
     total_ms = (time.monotonic() - t0) * 1000
 
