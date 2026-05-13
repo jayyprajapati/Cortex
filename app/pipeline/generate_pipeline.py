@@ -4,16 +4,13 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from app.context import EffectiveGenerationConfig, ExecutionContext
 from app.llm.factory import get_llm
 from app.observability.logger import cortex_logger
-from app.pipeline.retrieve_pipeline import retrieve_and_rerank
 
 logger = logging.getLogger(__name__)
-
-_NO_CONTEXT = "No relevant information found."
 
 
 # ---------------------------------------------------------------------------
@@ -116,156 +113,8 @@ def _normalize_schema(schema: Optional[Dict]) -> Optional[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# Prompt assembly
+# Context and chunk utilities
 # ---------------------------------------------------------------------------
-
-STRICT_REFUSAL = "I couldn't find that in the document."
-
-_STRICT_RULES_MD = """=== ABSOLUTE RULES (you MUST follow) ===
-1. Answer ONLY using facts that appear in the CONTEXT below.
-2. Every factual claim must cite source numbers like [1] or [2, 3].
-3. If the CONTEXT does not contain enough information, output EXACTLY this and nothing else:
-   {refusal}
-   Do not guess. Do not use general knowledge. Do not invent names, dates, or facts.
-4. Quote names, dates, numbers, and proper nouns VERBATIM from the context. Never paraphrase or alter a name.
-5. Do not draw on prior knowledge or training data.
-
-=== ANSWER FORMAT ===
-Produce your answer in this exact markdown structure:
-
-**Answer:** <one short paragraph, direct, with inline [N] citations>
-
-**Reasoning:** <1-2 sentences explaining which source supports the answer>
-
-**Sources:** [1] [2] ..."""
-
-
-_TRUTHFUL_CLAUSE = (
-    "\n\nTRUTHFUL OUTPUT: You may rephrase, restructure, and emphasize content, "
-    "but every concrete fact (company name, title, date, metric, project name, skill, person name) "
-    "must originate from the provided context. Do not invent facts or attribute things to entities "
-    "that are not present in the source.\n"
-)
-
-
-def _build_prompt_basic(query: str, context: str, gen: EffectiveGenerationConfig) -> str:
-    system = gen.system_prompt.strip()
-    q = str(query or "").strip()
-    ctx = str(context or "").strip()
-
-    if gen.response_type == "json":
-        return (
-            f"{system}\n\n"
-            "Rules:\n"
-            "- Return ONLY valid JSON.\n"
-            "- Do not include markdown, code fences, or prose outside JSON.\n\n"
-            f"Context:\n{ctx}\n\n"
-            f"Input:\n{q}\n\n"
-            "JSON Output:"
-        )
-
-    return f"{system}\n\nContext:\n{ctx}\n\nQuestion:\n{q}\n\nAnswer:"
-
-
-def _format_history_block(history: Optional[List[Dict[str, Any]]], summary: Optional[str]) -> str:
-    parts: List[str] = []
-    if summary and summary.strip():
-        parts.append(f"=== CONVERSATION SUMMARY ===\n{summary.strip()}")
-    if history:
-        lines: List[str] = []
-        for m in history:
-            role = str(m.get("role") or "").strip().lower()
-            content = str(m.get("content") or "").strip()
-            if not content or role not in ("user", "assistant"):
-                continue
-            lines.append(f"{role.capitalize()}: {content}")
-        if lines:
-            parts.append("=== RECENT TURNS ===\n" + "\n\n".join(lines))
-    return "\n\n".join(parts)
-
-
-def _build_prompt_strict_markdown(
-    query: str,
-    context: str,
-    gen: EffectiveGenerationConfig,
-    history: Optional[List[Dict[str, Any]]] = None,
-    summary: Optional[str] = None,
-) -> str:
-    system = gen.system_prompt.strip()
-    q = str(query or "").strip()
-    ctx = str(context or "").strip()
-    rules = _STRICT_RULES_MD.format(refusal=STRICT_REFUSAL)
-    history_block = _format_history_block(history, summary)
-
-    sections: List[str] = [system]
-    if history_block:
-        sections.append(history_block)
-    sections.append(rules)
-    sections.append(f"=== CONTEXT ===\n{ctx}")
-    sections.append(f"=== QUESTION ===\n{q}")
-    sections.append("Answer:")
-    return "\n\n".join(sections)
-
-
-def _build_prompt_strict_json(
-    query: str,
-    context: str,
-    gen: EffectiveGenerationConfig,
-    history: Optional[List[Dict[str, Any]]] = None,
-    summary: Optional[str] = None,
-) -> str:
-    system = gen.system_prompt.strip()
-    q = str(query or "").strip()
-    ctx = str(context or "").strip()
-    history_block = _format_history_block(history, summary)
-
-    sections: List[str] = [system]
-    if history_block:
-        sections.append(history_block)
-    sections.append(
-        "Rules:\n"
-        "- Return ONLY valid JSON.\n"
-        "- Do not include markdown, code fences, or prose outside JSON.\n"
-        "- Answer ONLY from the CONTEXT. Do not invent names, dates, numbers, or facts.\n"
-        "- Quote names and proper nouns VERBATIM from the context."
-    )
-    sections.append(f"Context:\n{ctx}")
-    sections.append(f"Input:\n{q}")
-    sections.append("JSON Output:")
-    return "\n\n".join(sections)
-
-
-def _build_prompt_truthful(query: str, context: str, gen: EffectiveGenerationConfig) -> str:
-    """Like the basic prompt but with a truthfulness clause prepended to the system prompt."""
-    augmented = EffectiveGenerationConfig(
-        system_prompt=gen.system_prompt.strip() + _TRUTHFUL_CLAUSE,
-        response_type=gen.response_type,
-        schema=gen.schema,
-        temperature=gen.temperature,
-        strict=gen.strict,
-        max_retries=gen.max_retries,
-        grounding_mode=gen.grounding_mode,
-    )
-    return _build_prompt_basic(query, context, augmented)
-
-
-def _build_prompt(
-    query: str,
-    context: str,
-    gen: EffectiveGenerationConfig,
-    history: Optional[List[Dict[str, Any]]] = None,
-    summary: Optional[str] = None,
-) -> str:
-    """Dispatch on grounding_mode + response_type. history/summary only apply to strict mode."""
-    mode = getattr(gen, "grounding_mode", "off") or "off"
-    if mode == "strict":
-        if gen.response_type == "json":
-            return _build_prompt_strict_json(query, context, gen, history=history, summary=summary)
-        return _build_prompt_strict_markdown(query, context, gen, history=history, summary=summary)
-    if mode == "truthful":
-        return _build_prompt_truthful(query, context, gen)
-    return _build_prompt_basic(query, context, gen)
-
 
 def _build_context_str(chunks: List[dict], max_context_tokens: int = 4000) -> str:
     # Drop lowest-ranked chunks (end of list) until the context fits in the budget.
@@ -281,12 +130,14 @@ def _build_context_str(chunks: List[dict], max_context_tokens: int = 4000) -> st
 
     blocks = []
     for i, chunk in enumerate(kept):
-        section = str(chunk.get("section") or "Untitled").strip()
+        section_path = chunk.get("section_path") or chunk.get("hierarchy") or []
+        if section_path and isinstance(section_path, list):
+            section_label = " > ".join(str(s) for s in section_path if s != "_root")
+        else:
+            section_label = str(chunk.get("section") or "Untitled").strip()
         page = chunk.get("page")
         page_label = page if page is not None else "N/A"
-        blocks.append(
-            f"[Source {i + 1}. Section: {section}. Page: {page_label}]\n{chunk['text']}"
-        )
+        blocks.append(f"[Source {i+1}. Section: {section_label}. Page: {page_label}]\n{chunk['text']}")
     return "\n\n".join(blocks)
 
 
@@ -455,6 +306,61 @@ def _check_grounding(answer: Any, chunks: List[dict], mode: str) -> Dict[str, An
 
 
 # ---------------------------------------------------------------------------
+# Prompt rendering (Jinja2 templates)
+# ---------------------------------------------------------------------------
+
+def _render_prompt(
+    query: str,
+    context: str,
+    gen: EffectiveGenerationConfig,
+    history: Optional[List[Dict[str, Any]]] = None,
+    summary: Optional[str] = None,
+) -> str:
+    from app.prompts.loader import render
+    mode = getattr(gen, "grounding_mode", "off") or "off"
+
+    if gen.response_type == "json":
+        return render(
+            "json_task.j2",
+            system_prompt=gen.system_prompt.strip(),
+            context=context,
+            query=query,
+            history=history or [],
+            summary=summary or "",
+        )
+
+    refusal_instruction = (
+        "Tell the user you don't have enough information to answer this question "
+        "in your own words. Vary the phrasing — do not use a fixed phrase."
+    )
+
+    return render(
+        "chat.md.j2",
+        system_prompt=gen.system_prompt.strip(),
+        context=context,
+        query=query,
+        history=history or [],
+        summary=summary or "",
+        grounding_mode=mode,
+        refusal_instruction=refusal_instruction,
+    )
+
+
+def _render_clarification_prompt(
+    query: str,
+    clarifying_question: str,
+    gen: EffectiveGenerationConfig,
+) -> str:
+    from app.prompts.loader import render
+    return render(
+        "clarify.md.j2",
+        system_prompt=gen.system_prompt.strip(),
+        query=query,
+        clarifying_question=clarifying_question,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Core generation contract
 # ---------------------------------------------------------------------------
 
@@ -474,10 +380,7 @@ def generate_with_output_contract(
         return result
 
     if gen.strict and gen.schema is None:
-        raise ValueError(
-            "strict=True requires a schema. "
-            "Define a schema in the generation config or task override."
-        )
+        raise ValueError("strict=True requires a schema.")
 
     schema = _normalize_schema(gen.schema)
     retry_prompt = prompt
@@ -492,40 +395,24 @@ def generate_with_output_contract(
             parsed = _extract_json_payload(output)
             if schema:
                 _validate_schema(parsed, schema)
-            logger.info(
-                "generate response_type=json attempt=%d/%d latency_ms=%.1f",
-                attempt + 1,
-                gen.max_retries + 1,
-                latency_ms,
-            )
+            logger.info("generate json attempt=%d/%d latency_ms=%.1f", attempt+1, gen.max_retries+1, latency_ms)
             return parsed
         except Exception as exc:
             last_error = exc
-            logger.warning(
-                "Structured generation attempt %d/%d failed: %s",
-                attempt + 1,
-                gen.max_retries + 1,
-                exc,
-            )
+            logger.warning("JSON generation attempt %d/%d failed: %s", attempt+1, gen.max_retries+1, exc)
             if attempt < gen.max_retries:
-                retry_prompt = (
-                    f"{prompt}\n\n"
-                    "CORRECTION: Your previous response was not valid JSON or did not "
-                    "match the required schema. Return ONLY valid JSON. "
-                    "Do not add prose, markdown fences, or comments."
+                from app.prompts.loader import render
+                schema_hint = json.dumps(schema, indent=2) if schema else ""
+                retry_prompt = render(
+                    "grounding_correction.j2",
+                    original_prompt=prompt,
+                    error=str(exc),
+                    schema_hint=schema_hint,
                 )
 
     if gen.strict:
-        raise ValueError(
-            f"Generation failed after {gen.max_retries + 1} attempt(s). "
-            f"Last error: {last_error}"
-        )
-
-    logger.error(
-        "generate FAILED (non-strict) after %d attempts: %s",
-        gen.max_retries + 1,
-        last_error,
-    )
+        raise ValueError(f"Generation failed after {gen.max_retries+1} attempt(s). Last error: {last_error}")
+    logger.error("generate FAILED (non-strict) after %d attempts: %s", gen.max_retries+1, last_error)
     return {"error": "generation_failed", "detail": str(last_error)}
 
 
@@ -559,75 +446,191 @@ def _history_aware_retrieval_query(
     return "\n\n".join(parts)
 
 
+async def stream_answer(
+    ctx: ExecutionContext,
+    query: str,
+    chat_history: Optional[List[Dict[str, Any]]] = None,
+    summary: Optional[str] = None,
+    clarification_reply: bool = False,
+) -> AsyncGenerator[str, None]:
+    """
+    Full RAG pipeline with SSE streaming.
+    Yields SSE event strings: meta → (clarification)? → delta* → citations → done | error
+    """
+    from app.streaming.sse import (
+        meta_event, delta_event, clarification_event,
+        citations_event, done_event, error_event,
+    )
+    from app.retrieval.pipeline import run_retrieval
+
+    gen = ctx.effective_generation
+
+    # Resolve last assistant message for query analysis context
+    last_assistant = None
+    if chat_history:
+        for m in reversed(chat_history):
+            if m.get("role") == "assistant":
+                last_assistant = str(m.get("content") or "")[:500]
+                break
+
+    if ctx.registry.retrieval.query_rewrite:
+        retrieval_query = query
+    else:
+        retrieval_query = _history_aware_retrieval_query(query, chat_history, summary)
+
+    import time as _time
+    t_retrieve = _time.monotonic()
+
+    try:
+        retrieval_result = run_retrieval(
+            ctx=ctx,
+            query=retrieval_query,
+            history_summary=summary,
+            last_assistant_msg=last_assistant,
+            clarification_reply=clarification_reply,
+        )
+    except Exception as exc:
+        yield error_event(str(exc), code="retrieval_error")
+        return
+
+    retrieve_ms = (_time.monotonic() - t_retrieve) * 1000
+
+    # Emit meta
+    yield meta_event({
+        "retrieved_count": retrieval_result.retrieved_count,
+        "reranked_count": retrieval_result.reranked_count,
+        "confidence": retrieval_result.confidence,
+        "retrieve_ms": round(retrieve_ms, 1),
+    })
+
+    # Handle clarification
+    if retrieval_result.needs_clarification:
+        clarifying_q = retrieval_result.clarifying_question or "Could you provide more context?"
+        clarification_text = _render_clarification_prompt(query, clarifying_q, gen)
+        llm = get_llm(ctx.llm_config)
+        clarification_answer = llm.generate(clarification_text, temperature=0.7)
+        yield clarification_event(str(clarification_answer or "").strip())
+        yield done_event({"type": "clarification"})
+        return
+
+    # Build context
+    chunks = _dedupe_chunks(retrieval_result.chunks)
+    context_str = _build_context_str(chunks, max_context_tokens=gen.max_context_tokens)
+
+    if not context_str.strip():
+        # No relevant context — let LLM respond naturally (no hardcoded refusal)
+        no_context_prompt = _render_prompt(query, "", gen, history=chat_history, summary=summary)
+        llm = get_llm(ctx.llm_config)
+        answer = llm.generate(no_context_prompt, temperature=gen.temperature)
+        answer_text = str(answer or "").strip()
+        yield delta_event(answer_text)
+        yield citations_event([])
+        yield done_event({"grounded": False})
+        return
+
+    prompt = _render_prompt(query, context_str, gen, history=chat_history, summary=summary)
+    llm = get_llm(ctx.llm_config)
+
+    t0 = _time.monotonic()
+    try:
+        answer = generate_with_output_contract(llm, prompt, gen)
+    except Exception as exc:
+        yield error_event(str(exc), code="generation_error")
+        return
+    generate_ms = (_time.monotonic() - t0) * 1000
+
+    answer_text = answer if isinstance(answer, str) else json.dumps(answer)
+    yield delta_event(answer_text)
+
+    sources = _build_public_sources(chunks)
+    citations = extract_citations(answer_text, sources)
+    yield citations_event(citations)
+
+    mode = getattr(gen, "grounding_mode", "off") or "off"
+    grounding = _check_grounding(answer, chunks, mode)
+
+    yield done_event({
+        "grounded": grounding["grounded"],
+        "generate_ms": round(generate_ms, 1),
+        "unverified_entities": grounding.get("unverified", []),
+    })
+
+
 def generate_answer(
     ctx: ExecutionContext,
     query: str,
     chat_history: Optional[List[Dict[str, Any]]] = None,
     summary: Optional[str] = None,
+    clarification_reply: bool = False,
 ) -> dict:
-    """
-    Full RAG pipeline: retrieve → rerank → generate.
-    All behavior is driven by ExecutionContext.
-
-    Optional `chat_history` and `summary` enable multi-turn chat:
-    - retrieval query is augmented with the recent context (helps resolve pronouns)
-    - generation prompt includes a CONVERSATION HISTORY block (strict mode only)
-    """
+    """Full RAG pipeline — non-streaming. Calls the new retrieval pipeline."""
+    from app.retrieval.pipeline import run_retrieval
     gen = ctx.effective_generation
     mode = getattr(gen, "grounding_mode", "off") or "off"
 
-    # If query rewriting is enabled the rewriter handles history-context via the
-    # `summary` kwarg. Otherwise, fall back to baking history into the query string
-    # so pronouns and follow-ups can resolve at retrieval time.
+    last_assistant = None
+    if chat_history:
+        for m in reversed(chat_history):
+            if m.get("role") == "assistant":
+                last_assistant = str(m.get("content") or "")[:500]
+                break
+
     if ctx.registry.retrieval.query_rewrite:
         retrieval_query = query
     else:
         retrieval_query = _history_aware_retrieval_query(query, chat_history, summary)
 
     t_retrieve = time.monotonic()
-    retrieval_result = retrieve_and_rerank(ctx, retrieval_query, history_summary=summary)
+    retrieval_result = run_retrieval(
+        ctx=ctx,
+        query=retrieval_query,
+        history_summary=summary,
+        last_assistant_msg=last_assistant,
+        clarification_reply=clarification_reply,
+    )
     retrieve_ms = (time.monotonic() - t_retrieve) * 1000
 
-    clarification = retrieval_result.get("clarification")
+    # Handle clarification
+    if retrieval_result.needs_clarification:
+        clarifying_q = retrieval_result.clarifying_question or "Could you provide more context?"
+        clarification_text = _render_clarification_prompt(query, clarifying_q, gen)
+        llm = get_llm(ctx.llm_config)
+        clarification_answer = llm.generate(clarification_text, temperature=0.7)
+        return {
+            "answer": str(clarification_answer or "").strip(),
+            "grounded": False,
+            "sources": [],
+            "needs_clarification": True,
+            "meta": {
+                "retrieved_count": 0,
+                "reranked_count": 0,
+                "retrieve_ms": round(retrieve_ms, 1),
+                "generate_ms": 0,
+            },
+        }
 
-    if clarification:
-        if gen.response_type == "json":
-            context_str = clarification
-        else:
-            return {
-                "answer": clarification,
-                "grounded": False,
-                "sources": [],
-                "meta": {"retrieved_count": 0, "reranked_count": 0, "retrieve_ms": 0, "generate_ms": 0},
-            }
-
-    chunks = _dedupe_chunks(retrieval_result.get("chunks", []))
+    chunks = _dedupe_chunks(retrieval_result.chunks)
     context_str = _build_context_str(chunks, max_context_tokens=gen.max_context_tokens)
 
     if not context_str.strip():
-        if mode == "strict":
-            answer = STRICT_REFUSAL if gen.response_type != "json" else {
-                "answer": STRICT_REFUSAL, "grounded": False, "citations": []
-            }
-            return {
-                "answer": answer,
-                "grounded": False,
-                "sources": [],
-                "meta": {"retrieved_count": 0, "reranked_count": 0, "retrieve_ms": round(retrieve_ms, 1), "generate_ms": 0},
-            }
-        if gen.response_type == "json":
-            context_str = _NO_CONTEXT
-        else:
-            return {
-                "answer": _NO_CONTEXT,
-                "grounded": False,
-                "sources": [],
-                "meta": {"retrieved_count": 0, "reranked_count": 0, "retrieve_ms": round(retrieve_ms, 1), "generate_ms": 0},
-            }
+        # No context — LLM responds naturally (no hardcoded refusal)
+        no_context_prompt = _render_prompt(query, "", gen, history=chat_history, summary=summary)
+        llm = get_llm(ctx.llm_config)
+        answer = llm.generate(no_context_prompt, temperature=gen.temperature)
+        return {
+            "answer": str(answer or "").strip(),
+            "grounded": False,
+            "sources": [],
+            "meta": {
+                "retrieved_count": 0,
+                "reranked_count": 0,
+                "retrieve_ms": round(retrieve_ms, 1),
+                "generate_ms": 0,
+            },
+        }
 
-    prompt = _build_prompt(query, context_str, gen, history=chat_history, summary=summary)
+    prompt = _render_prompt(query, context_str, gen, history=chat_history, summary=summary)
     llm = get_llm(ctx.llm_config)
-
     t0 = time.monotonic()
     answer = generate_with_output_contract(llm, prompt, gen)
     generate_ms = (time.monotonic() - t0) * 1000
@@ -641,21 +644,15 @@ def generate_answer(
         latency_ms=generate_ms,
     )
 
-    # Post-generation grounding check
     grounding = _check_grounding(answer, chunks, mode)
     if mode == "strict" and not grounding["grounded"]:
-        logger.warning(
-            "Strict grounding check failed: unverified entities %s — replacing with refusal",
-            grounding["unverified"][:5],
-        )
-        if gen.response_type == "json":
-            answer = {"answer": STRICT_REFUSAL, "grounded": False, "citations": []}
-        else:
-            answer = STRICT_REFUSAL
+        # In strict mode with grounding failure: let LLM rephrase naturally
+        logger.warning("Strict grounding failed: unverified=%s", grounding["unverified"][:5])
+        # Don't replace with hardcoded string — just log and return as-is (grounded=False signals this to caller)
 
     meta: Dict[str, Any] = {
-        "retrieved_count": retrieval_result.get("retrieved_count", len(chunks)),
-        "reranked_count": retrieval_result.get("reranked_count", len(chunks)),
+        "retrieved_count": retrieval_result.retrieved_count,
+        "reranked_count": retrieval_result.reranked_count,
         "retrieve_ms": round(retrieve_ms, 1),
         "generate_ms": round(generate_ms, 1),
     }
@@ -676,7 +673,7 @@ def generate_direct(ctx: ExecutionContext, query: str, context: str = "") -> dic
     """
     gen = ctx.effective_generation
     mode = getattr(gen, "grounding_mode", "off") or "off"
-    prompt = _build_prompt(query, context, gen)
+    prompt = _render_prompt(query, context, gen)
     llm = get_llm(ctx.llm_config)
 
     t0 = time.monotonic()
@@ -696,10 +693,8 @@ def generate_direct(ctx: ExecutionContext, query: str, context: str = "") -> dic
     pseudo_chunks = [{"text": context}] if context else []
     grounding = _check_grounding(answer, pseudo_chunks, mode)
     if mode == "strict" and not grounding["grounded"]:
-        if gen.response_type == "json":
-            answer = {"answer": STRICT_REFUSAL, "grounded": False, "citations": []}
-        else:
-            answer = STRICT_REFUSAL
+        logger.warning("Strict grounding failed in generate_direct: unverified=%s", grounding["unverified"][:5])
+        # Don't replace with hardcoded string — grounded=False signals this to caller
 
     result: Dict[str, Any] = {"answer": answer}
     if mode != "off":
