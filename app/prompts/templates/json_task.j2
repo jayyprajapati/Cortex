@@ -1,0 +1,27 @@
+{{ system_prompt }}
+
+{% if summary %}
+=== CONVERSATION SUMMARY ===
+{{ summary }}
+
+{% endif %}
+{% if history %}
+=== RECENT TURNS ===
+{% for msg in history %}
+{{ msg.role | capitalize }}: {{ msg.content }}
+{% endfor %}
+
+{% endif %}
+Rules:
+- Return ONLY valid JSON.
+- Do not include markdown, code fences, or prose outside JSON.
+- Answer ONLY from the CONTEXT. Do not invent names, dates, numbers, or facts.
+- Quote names and proper nouns VERBATIM from the context.
+
+Context:
+{{ context }}
+
+Input:
+{{ query }}
+
+JSON Output:
