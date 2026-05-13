@@ -4,13 +4,6 @@ from typing import Any, Dict, List, Optional
 
 from app.ingestion.loaders.base import BaseLoader, Element
 
-_UNSTRUCTURED_AVAILABLE = True
-try:
-    from unstructured.partition.auto import partition as _partition
-except ImportError:
-    _UNSTRUCTURED_AVAILABLE = False
-
-
 _TYPE_MAP = {
     "Title": "heading_l1",
     "NarrativeText": "paragraph",
@@ -30,11 +23,11 @@ class UnstructuredLoader(BaseLoader):
         return ext in (".docx", ".html", ".htm", ".txt")
 
     def load(self, path: str) -> List[Element]:
-        if not _UNSTRUCTURED_AVAILABLE:
-            raise ImportError(
-                "unstructured is not installed. Run: pip install unstructured[local-inference]"
-            )
-        raw_elements = _partition(filename=path)
+        try:
+            from unstructured.partition.auto import partition
+        except ImportError:
+            raise ImportError("unstructured is not installed. Run: pip install 'unstructured[local-inference]'")
+        raw_elements = partition(filename=path)
         elements: List[Element] = []
         for el in raw_elements:
             type_name = type(el).__name__

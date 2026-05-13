@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-import fitz
-
 from app.ingestion.loaders.base import BaseLoader, Element
 
 
@@ -16,6 +14,10 @@ class PyMuPDFLoader(BaseLoader):
         return ext in (".pdf", ".PDF")
 
     def load(self, path: str) -> List[Element]:
+        try:
+            import fitz
+        except ImportError:
+            raise ImportError("PyMuPDF is not installed. Run: pip install PyMuPDF")
         doc = fitz.open(path)
         elements: List[Element] = []
 

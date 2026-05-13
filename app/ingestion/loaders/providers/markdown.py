@@ -4,12 +4,6 @@ from typing import Any, Dict, List
 
 from app.ingestion.loaders.base import BaseLoader, Element
 
-_MDI_AVAILABLE = True
-try:
-    from markdown_it import MarkdownIt as _MarkdownIt
-except ImportError:
-    _MDI_AVAILABLE = False
-
 _HEADING_TAG_MAP = {
     "h1": "heading_l1",
     "h2": "heading_l2",
@@ -29,19 +23,18 @@ class MarkdownLoader(BaseLoader):
         return ext in (".md", ".markdown")
 
     def load(self, path: str) -> List[Element]:
-        if not _MDI_AVAILABLE:
-            raise ImportError(
-                "markdown-it-py is not installed. Run: pip install markdown-it-py"
-            )
+        try:
+            from markdown_it import MarkdownIt
+        except ImportError:
+            raise ImportError("markdown-it-py is not installed. Run: pip install markdown-it-py")
+        md = MarkdownIt()
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        md = _MarkdownIt()
         tokens = md.parse(content)
         elements: List[Element] = []
         current_heading_type: str | None = None
         in_list_item = False
-        in_fence = False
 
         i = 0
         while i < len(tokens):

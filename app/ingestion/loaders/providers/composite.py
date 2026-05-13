@@ -33,7 +33,10 @@ class CompositeLoader(BaseLoader):
         ext = os.path.splitext(path)[1].lower()
 
         if ext == ".pdf":
-            return self._pdf_loader.load(path)
+            try:
+                return self._pdf_loader.load(path)
+            except Exception:
+                return self._pdf_fallback.load(path)
 
         if ext in (".docx", ".doc"):
             try:

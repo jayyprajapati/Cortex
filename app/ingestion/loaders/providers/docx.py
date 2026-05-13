@@ -5,11 +5,7 @@ from typing import Any, Dict, List
 
 from app.ingestion.loaders.base import BaseLoader, Element
 
-_DOCX_AVAILABLE = True
-try:
-    import docx as _docx_lib
-except ImportError:
-    _DOCX_AVAILABLE = False
+_HEADING_RE = re.compile(r'^Heading (\d+)$')
 
 
 class DocxLoader(BaseLoader):
@@ -21,22 +17,21 @@ class DocxLoader(BaseLoader):
         return ext == ".docx"
 
     def load(self, path: str) -> List[Element]:
-        if not _DOCX_AVAILABLE:
-            raise ImportError(
-                "python-docx is not installed. Run: pip install python-docx"
-            )
-        doc = _docx_lib.Document(path)
+        try:
+            import docx as _docx
+        except ImportError:
+            raise ImportError("python-docx is not installed. Run: pip install python-docx")
+        doc = _docx.Document(path)
         elements: List[Element] = []
         for para in doc.paragraphs:
             text = para.text
             if not text.strip():
                 continue
             style_name = para.style.name if para.style else ""
-            if style_name.startswith("Heading"):
-                match = re.search(r"\d+", style_name)
-                level = int(match.group()) if match else 1
-                level = min(max(level, 1), 6)
-                elem_type = f"heading_l{level}"
+            m = _HEADING_RE.match(style_name)
+            if m:
+                level = int(m.group(1))
+                elem_type = f"heading_l{min(level, 6)}"
             elif "List" in style_name:
                 elem_type = "list_item"
             else:
