@@ -11,7 +11,6 @@ class BaseEmbedder(ABC):
         ...
 
     @property
-    @abstractmethod
     def supports_sparse(self) -> bool:
         return False
 
