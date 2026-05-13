@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS threads (
     title TEXT,
     summary TEXT,
     summary_up_to_message_idx INTEGER NOT NULL DEFAULT 0,
+    clarification_pending INTEGER NOT NULL DEFAULT 0,
+    clarification_context TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -57,6 +59,12 @@ CREATE INDEX IF NOT EXISTS idx_messages_thread
     ON messages(thread_id, id);
 """
 
+# Migrations applied once against existing databases that pre-date new columns.
+_MIGRATIONS = [
+    "ALTER TABLE threads ADD COLUMN clarification_pending INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE threads ADD COLUMN clarification_context TEXT",
+]
+
 
 def _get_conn() -> sqlite3.Connection:
     global _conn
@@ -71,6 +79,12 @@ def _get_conn() -> sqlite3.Connection:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.executescript(_SCHEMA)
+        # Apply additive migrations idempotently (ignore "duplicate column" errors).
+        for stmt in _MIGRATIONS:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # Column already exists — safe to ignore.
         _conn = conn
         logger.info("threads sqlite ready at %s", _DB_PATH)
         return _conn
@@ -81,6 +95,7 @@ def _now() -> int:
 
 
 def _row_to_thread(row: sqlite3.Row) -> Dict[str, Any]:
+    keys = row.keys()
     return {
         "id": row["id"],
         "app_name": row["app_name"],
@@ -89,6 +104,8 @@ def _row_to_thread(row: sqlite3.Row) -> Dict[str, Any]:
         "title": row["title"],
         "summary": row["summary"],
         "summary_up_to_message_idx": row["summary_up_to_message_idx"],
+        "clarification_pending": bool(row["clarification_pending"]) if "clarification_pending" in keys else False,
+        "clarification_context": row["clarification_context"] if "clarification_context" in keys else None,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -251,6 +268,35 @@ def update_title(thread_id: str, title: str) -> None:
         _get_conn().execute(
             "UPDATE threads SET title = ?, updated_at = ? WHERE id = ?",
             (title, now, thread_id),
+        )
+
+
+# Columns that update_thread_meta is allowed to touch (allowlist guards against SQL injection).
+_UPDATABLE_META_COLUMNS = frozenset({
+    "clarification_pending",
+    "clarification_context",
+    "title",
+    "summary",
+    "summary_up_to_message_idx",
+})
+
+
+def update_thread_meta(thread_id: str, meta: Dict[str, Any]) -> None:
+    """Update arbitrary metadata fields on a thread record.
+
+    Only keys present in ``_UPDATABLE_META_COLUMNS`` are written; unknown keys
+    are silently ignored so callers don't need to filter themselves.
+    """
+    allowed = {k: v for k, v in meta.items() if k in _UPDATABLE_META_COLUMNS}
+    if not allowed:
+        return
+    now = _now()
+    set_clause = ", ".join(f"{col} = ?" for col in allowed)
+    values = list(allowed.values()) + [now, thread_id]
+    with _write_lock:
+        _get_conn().execute(
+            f"UPDATE threads SET {set_clause}, updated_at = ? WHERE id = ?",
+            values,
         )
 
 
