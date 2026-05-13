@@ -1,26 +1,33 @@
 {
   "doclens": {
     "collection": "doclens",
-    "ingestion": {
-      "strategy": "semantic_doc",
+    "loader": {"provider": "composite"},
+    "chunking": {
+      "strategy": "layout_aware_semantic",
       "max_tokens": 512,
-      "min_tokens": 50,
-      "overlap_tokens": 64,
-      "semantic_split": true
+      "min_tokens": 128,
+      "keep_tables_atomic": true,
+      "keep_code_atomic": true
     },
     "embedding": {
-      "model": "BAAI/bge-small-en",
+      "provider": "sentence_transformers",
+      "model": "BAAI/bge-small-en-v1.5",
       "batch_size": 32,
       "normalize": true
     },
+    "vector_store": {"provider": "qdrant", "distance": "cosine"},
     "retrieval": {
       "top_k": 10,
-      "hybrid": true,
-      "alpha": 0.7,
-      "query_rewrite": true
+      "fusion": "rrf",
+      "alpha": 0.5,
+      "query_rewrite": true,
+      "expand_neighbors": true,
+      "neighbor_budget_tokens": 400,
+      "confidence_min_score": 0.25
     },
     "reranking": {
       "enabled": true,
+      "provider": "sentence_transformers",
       "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
       "top_k": 5,
       "candidate_cap": 20,
@@ -32,6 +39,11 @@
       "strict": false,
       "max_retries": 2,
       "grounding_mode": "off"
+    },
+    "conversation": {
+      "clarification_policy": "balanced",
+      "max_history_turns": 10,
+      "use_query_analyzer": true
     },
     "defaults": {
       "system_prompt": "You are DocLens, a document intelligence assistant. Answer only from the retrieved context. Format your response in clear markdown. If the answer is not present in the context, say so explicitly."
@@ -49,26 +61,30 @@
     }
   },
   "resumelab": {
-    "collection": "resume_memory",
-    "ingestion": {
+    "collection": "resume-memory",
+    "loader": {"provider": "composite"},
+    "chunking": {
       "strategy": "resume_canonical",
       "max_tokens": 512,
-      "min_tokens": 30,
-      "overlap_tokens": 0,
-      "semantic_split": false
+      "min_tokens": 30
     },
     "embedding": {
-      "model": "BAAI/bge-small-en",
+      "provider": "sentence_transformers",
+      "model": "BAAI/bge-small-en-v1.5",
       "batch_size": 32,
       "normalize": true
     },
+    "vector_store": {"provider": "qdrant", "distance": "cosine"},
     "retrieval": {
       "top_k": 12,
-      "hybrid": true,
-      "alpha": 0.7
+      "fusion": "rrf",
+      "alpha": 0.5,
+      "query_rewrite": false,
+      "expand_neighbors": false
     },
     "reranking": {
       "enabled": true,
+      "provider": "sentence_transformers",
       "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
       "top_k": 6,
       "candidate_cap": 24
@@ -78,6 +94,10 @@
       "temperature": 0.05,
       "strict": true,
       "max_retries": 3
+    },
+    "conversation": {
+      "clarification_policy": "never",
+      "use_query_analyzer": false
     },
     "defaults": {
       "system_prompt": "You are a structured career intelligence engine. Extract, normalize, and organize professional experience with factual accuracy."
@@ -92,19 +112,7 @@
         "max_context_tokens": 8000,
         "schema": {
           "type": "object",
-          "required": [
-            "match_score",
-            "required_keywords",
-            "missing_keywords",
-            "existing_but_missing_from_resume",
-            "irrelevant_content",
-            "recommended_additions",
-            "recommended_removals",
-            "section_rewrites",
-            "ats_keyword_clusters",
-            "role_seniority",
-            "domain_fit"
-          ],
+          "required": ["match_score","required_keywords","missing_keywords","existing_but_missing_from_resume","irrelevant_content","recommended_additions","recommended_removals","section_rewrites","ats_keyword_clusters","role_seniority","domain_fit"],
           "properties": {
             "match_score": {"type": "number"},
             "required_keywords": {"type": "array", "items": {"type": "string"}},
@@ -130,25 +138,12 @@
         "max_context_tokens": 8000,
         "schema": {
           "type": "object",
-          "required": ["summary", "skills", "projects", "experience", "target_keywords_used", "removed_content", "match_score_improved"],
+          "required": ["summary","skills","projects","experience","target_keywords_used","removed_content","match_score_improved"],
           "properties": {
             "summary": {"type": "string"},
             "skills": {"type": "array", "items": {"type": "string"}},
             "projects": {"type": "array"},
-            "experience": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "required": ["company", "title", "bullets"],
-                "properties": {
-                  "company": {"type": "string"},
-                  "title": {"type": "string"},
-                  "date_range": {"type": ["string", "null"]},
-                  "location": {"type": ["string", "null"]},
-                  "bullets": {"type": "array", "items": {"type": "string"}}
-                }
-              }
-            },
+            "experience": {"type": "array", "items": {"type": "object", "required": ["company","title","bullets"], "properties": {"company": {"type": "string"}, "title": {"type": "string"}, "date_range": {"type": ["string","null"]}, "location": {"type": ["string","null"]}, "bullets": {"type": "array", "items": {"type": "string"}}}}},
             "target_keywords_used": {"type": "array", "items": {"type": "string"}},
             "removed_content": {"type": "array", "items": {"type": "string"}},
             "match_score_improved": {"type": "number"}
@@ -165,33 +160,12 @@
         "max_context_tokens": 8000,
         "schema": {
           "type": "object",
-          "required": [
-            "summary",
-            "skills",
-            "projects",
-            "experience",
-            "target_keywords_used",
-            "removed_content",
-            "match_score_improved"
-          ],
+          "required": ["summary","skills","projects","experience","target_keywords_used","removed_content","match_score_improved"],
           "properties": {
             "summary": {"type": "string"},
             "skills": {"type": "array", "items": {"type": "string"}},
             "projects": {"type": "array"},
-            "experience": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "required": ["company", "title", "bullets"],
-                "properties": {
-                  "company": {"type": "string"},
-                  "title": {"type": "string"},
-                  "date_range": {"type": ["string", "null"]},
-                  "location": {"type": ["string", "null"]},
-                  "bullets": {"type": "array", "items": {"type": "string"}}
-                }
-              }
-            },
+            "experience": {"type": "array", "items": {"type": "object", "required": ["company","title","bullets"], "properties": {"company": {"type": "string"}, "title": {"type": "string"}, "date_range": {"type": ["string","null"]}, "location": {"type": ["string","null"]}, "bullets": {"type": "array", "items": {"type": "string"}}}}},
             "target_keywords_used": {"type": "array", "items": {"type": "string"}},
             "removed_content": {"type": "array", "items": {"type": "string"}},
             "match_score_improved": {"type": "number"}
@@ -216,11 +190,8 @@
         "max_retries": 2,
         "schema": {
           "type": "object",
-          "required": ["subject", "body"],
-          "properties": {
-            "subject": {"type": "string"},
-            "body": {"type": "string"}
-          }
+          "required": ["subject","body"],
+          "properties": {"subject": {"type": "string"}, "body": {"type": "string"}}
         }
       },
       "compose_rewrite": {
@@ -234,25 +205,29 @@
   },
   "cvscan": {
     "collection": "cvscan",
-    "ingestion": {
+    "loader": {"provider": "composite"},
+    "chunking": {
       "strategy": "resume_structured",
       "max_tokens": 256,
-      "min_tokens": 30,
-      "overlap_tokens": 0,
-      "semantic_split": false
+      "min_tokens": 30
     },
     "embedding": {
-      "model": "BAAI/bge-small-en",
+      "provider": "sentence_transformers",
+      "model": "BAAI/bge-small-en-v1.5",
       "batch_size": 32,
       "normalize": true
     },
+    "vector_store": {"provider": "qdrant", "distance": "cosine"},
     "retrieval": {
       "top_k": 15,
-      "hybrid": true,
-      "alpha": 0.6
+      "fusion": "rrf",
+      "alpha": 0.5,
+      "query_rewrite": false,
+      "expand_neighbors": false
     },
     "reranking": {
       "enabled": true,
+      "provider": "sentence_transformers",
       "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
       "top_k": 8,
       "candidate_cap": 30
@@ -262,6 +237,10 @@
       "temperature": 0.05,
       "strict": true,
       "max_retries": 3
+    },
+    "conversation": {
+      "clarification_policy": "never",
+      "use_query_analyzer": false
     },
     "defaults": {
       "system_prompt": "You are CVScan, a professional resume analysis assistant. Analyze the provided context and return ONLY valid JSON matching the required schema."
@@ -273,7 +252,7 @@
         "response_type": "json",
         "schema": {
           "type": "object",
-          "required": ["candidate_name", "score", "strengths", "weaknesses", "missing_keywords", "summary"],
+          "required": ["candidate_name","score","strengths","weaknesses","missing_keywords","summary"],
           "properties": {
             "candidate_name": {"type": "string"},
             "score": {"type": "number"},
@@ -290,7 +269,7 @@
         "response_type": "json",
         "schema": {
           "type": "object",
-          "required": ["candidate_name", "contact", "summary", "skills", "experience", "education", "certifications", "projects"],
+          "required": ["candidate_name","contact","summary","skills","experience","education","certifications","projects"],
           "properties": {
             "candidate_name": {"type": "string"},
             "contact": {"type": "object"},
@@ -309,7 +288,7 @@
         "response_type": "json",
         "schema": {
           "type": "object",
-          "required": ["matching_skills", "missing_skills", "strengths", "gaps", "recommendations", "confidence"],
+          "required": ["matching_skills","missing_skills","strengths","gaps","recommendations","confidence"],
           "properties": {
             "matching_skills": {"type": "array", "items": {"type": "string"}},
             "missing_skills": {"type": "array", "items": {"type": "string"}},
@@ -326,7 +305,7 @@
         "response_type": "json",
         "schema": {
           "type": "object",
-          "required": ["headline", "summary", "skills", "experience_bullets", "education", "certifications", "projects"],
+          "required": ["headline","summary","skills","experience_bullets","education","certifications","projects"],
           "properties": {
             "headline": {"type": "string"},
             "summary": {"type": "string"},
