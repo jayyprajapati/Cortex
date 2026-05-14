@@ -137,8 +137,11 @@ def create_thread(
     user_id: str,
     doc_ids: Optional[List[str]] = None,
     title: Optional[str] = None,
+    thread_id: Optional[str] = None,
 ) -> str:
-    thread_id = uuid.uuid4().hex
+    # Allow callers to provide their own thread_id (client-managed sessions).
+    # Falls back to a server-generated UUID hex.
+    tid = thread_id or uuid.uuid4().hex
     now = _now()
     with _write_lock:
         _get_conn().execute(
@@ -146,7 +149,7 @@ def create_thread(
             "summary_up_to_message_idx, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
             (
-                thread_id,
+                tid,
                 app_name,
                 user_id,
                 json.dumps(list(doc_ids or [])),
@@ -155,7 +158,7 @@ def create_thread(
                 now,
             ),
         )
-    return thread_id
+    return tid
 
 
 def get_thread(thread_id: str) -> Optional[Dict[str, Any]]:

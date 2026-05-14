@@ -414,14 +414,25 @@ async def chat_endpoint(request: Request, stream: bool = True):
 
     llm_override = _llm_override_from_request(payload.llm)
 
-    # Resolve or create thread
+    # Resolve or create thread.
+    # If the caller provides a thread_id that does not yet exist, create it with
+    # that ID (client-managed sessions). If it does exist, verify ownership.
     if payload.thread_id:
         thread = get_thread(payload.thread_id)
         if thread is None:
-            raise HTTPException(status_code=404, detail="Thread not found")
-        if thread["user_id"] != user_id or thread["app_name"] != app_name:
-            raise HTTPException(status_code=403, detail="Thread does not belong to this user")
-        doc_ids = thread["doc_ids"] or payload.doc_ids
+            doc_ids = payload.doc_ids or []
+            create_thread(
+                app_name=app_name,
+                user_id=user_id,
+                doc_ids=doc_ids,
+                title=_auto_title(query),
+                thread_id=payload.thread_id,
+            )
+            thread = get_thread(payload.thread_id)
+        else:
+            if thread["user_id"] != user_id or thread["app_name"] != app_name:
+                raise HTTPException(status_code=403, detail="Thread does not belong to this user")
+            doc_ids = thread["doc_ids"] or payload.doc_ids
     else:
         doc_ids = payload.doc_ids or []
         thread_id_new = create_thread(
