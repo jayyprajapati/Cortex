@@ -451,6 +451,7 @@ async def chat_endpoint(request: Request, stream: bool = True):
             task=task,
             doc_ids=doc_ids,
             llm_override=llm_override,
+            prompt_override=payload.prompt_override,
         )
     except HTTPException:
         raise

@@ -1,4 +1,65 @@
 {
+  "portfolio": {
+    "collection": "portfolio",
+    "loader": {"provider": "composite"},
+    "chunking": {
+      "strategy": "layout_aware_semantic",
+      "max_tokens": 512,
+      "min_tokens": 128,
+      "keep_tables_atomic": true,
+      "keep_code_atomic": true
+    },
+    "embedding": {
+      "provider": "sentence_transformers",
+      "model": "BAAI/bge-small-en-v1.5",
+      "batch_size": 32,
+      "normalize": true
+    },
+    "vector_store": {"provider": "qdrant", "distance": "cosine"},
+    "retrieval": {
+      "top_k": 10,
+      "fusion": "rrf",
+      "alpha": 0.5,
+      "query_rewrite": true,
+      "expand_neighbors": true,
+      "neighbor_budget_tokens": 400,
+      "confidence_min_score": 0.25
+    },
+    "reranking": {
+      "enabled": true,
+      "provider": "sentence_transformers",
+      "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+      "top_k": 5,
+      "candidate_cap": 20,
+      "diversity": 0.2
+    },
+    "generation": {
+      "response_type": "markdown",
+      "temperature": 0.2,
+      "strict": false,
+      "max_retries": 2,
+      "grounding_mode": "off"
+    },
+    "conversation": {
+      "clarification_policy": "never",
+      "max_history_turns": 10,
+      "use_query_analyzer": true
+    },
+    "defaults": {
+      "system_prompt": "You are a portfolio assistant for Jay Prajapati. Answer questions grounded strictly in the supplied context. Be concise and conversational. If the context doesn't cover the question, say so plainly — never invent experience, projects, or skills."
+    },
+    "default_task": "chat",
+    "tasks": {
+      "chat": {
+        "system_prompt": "You are a portfolio assistant for Jay Prajapati. Answer questions grounded strictly in the supplied context. Be concise and conversational. If the context doesn't cover the question, say so plainly — never invent experience, projects, or skills.",
+        "response_type": "markdown",
+        "grounding_mode": "off",
+        "temperature": 0.2,
+        "max_retries": 1,
+        "max_context_tokens": 4000
+      }
+    }
+  },
   "doclens": {
     "collection": "doclens",
     "loader": {"provider": "composite"},

@@ -17,6 +17,7 @@ class ChatRequest(BaseModel):
     doc_ids: Optional[List[str]] = None
     task: Optional[str] = None
     llm: Optional[LLMOverride] = None
+    prompt_override: Optional[str] = None
 
 
 class Citation(BaseModel):
