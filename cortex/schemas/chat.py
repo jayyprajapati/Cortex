@@ -18,6 +18,7 @@ class ChatRequest(BaseModel):
     task: Optional[str] = None
     llm: Optional[LLMOverride] = None
     prompt_override: Optional[str] = None
+    voice_footer: Optional[str] = None
 
 
 class Citation(BaseModel):

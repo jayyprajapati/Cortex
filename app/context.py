@@ -36,6 +36,7 @@ class EffectiveGenerationConfig:
     max_retries: int
     grounding_mode: GroundingMode = "off"
     max_context_tokens: int = 4000
+    voice_footer: Optional[str] = None
 
 
 @dataclass

@@ -463,6 +463,7 @@ async def chat_endpoint(request: Request, stream: bool = True):
             doc_ids=doc_ids,
             llm_override=llm_override,
             prompt_override=payload.prompt_override,
+            voice_footer=payload.voice_footer,
         )
     except HTTPException:
         raise

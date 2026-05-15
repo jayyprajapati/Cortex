@@ -32,6 +32,11 @@ TRUTHFUL OUTPUT: You may rephrase and restructure content, but every concrete fa
 === CONTEXT ===
 {{ context }}
 
+{% if voice_footer %}
+=== VOICE REMINDER ===
+{{ voice_footer }}
+
+{% endif %}
 === QUESTION ===
 {{ query }}
 

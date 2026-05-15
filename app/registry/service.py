@@ -62,9 +62,11 @@ def _resolve_effective_generation(
     config: ApplicationConfig,
     task: Optional[str],
     prompt_override: Optional[str],
+    voice_footer: Optional[str] = None,
 ) -> EffectiveGenerationConfig:
     base = config.generation
     system_prompt = config.defaults.system_prompt
+    resolved_voice_footer: Optional[str] = None
 
     resolved_task = task or config.default_task
     task_override: Optional[TaskOverride] = None
@@ -81,6 +83,8 @@ def _resolve_effective_generation(
         max_retries = task_override.max_retries if task_override.max_retries is not None else base.max_retries
         grounding_mode = task_override.grounding_mode if task_override.grounding_mode is not None else base.grounding_mode
         max_context_tokens = task_override.max_context_tokens if task_override.max_context_tokens is not None else base.max_context_tokens
+        if task_override.voice_footer:
+            resolved_voice_footer = task_override.voice_footer
     else:
         response_type = base.response_type
         schema = base.output_schema
@@ -93,6 +97,11 @@ def _resolve_effective_generation(
     if prompt_override:
         system_prompt = prompt_override.strip()
 
+    # Request-level voice_footer wins over task-level
+    if voice_footer is not None:
+        stripped = voice_footer.strip()
+        resolved_voice_footer = stripped or None
+
     return EffectiveGenerationConfig(
         system_prompt=system_prompt,
         response_type=response_type,
@@ -102,6 +111,7 @@ def _resolve_effective_generation(
         max_retries=max_retries,
         grounding_mode=grounding_mode,
         max_context_tokens=max_context_tokens,
+        voice_footer=resolved_voice_footer,
     )
 
 
@@ -166,6 +176,7 @@ def build_execution_context(
     doc_ids: Optional[List[str]] = None,
     llm_override: Optional[Dict[str, Any]] = None,
     prompt_override: Optional[str] = None,
+    voice_footer: Optional[str] = None,
     request_overrides: Optional[Dict[str, Any]] = None,
 ) -> ExecutionContext:
     normalized_app = (app_name or "").strip().lower()
@@ -188,7 +199,7 @@ def build_execution_context(
         )
 
     llm_config = _resolve_llm_config(llm_override)
-    effective_gen = _resolve_effective_generation(config, normalized_task, prompt_override)
+    effective_gen = _resolve_effective_generation(config, normalized_task, prompt_override, voice_footer)
     components = _resolve_components(config)
 
     clean_doc_ids: Optional[List[str]] = None

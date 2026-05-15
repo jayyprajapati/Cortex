@@ -334,6 +334,8 @@ def _render_prompt(
         "in your own words. Vary the phrasing — do not use a fixed phrase."
     )
 
+    voice_footer = (getattr(gen, "voice_footer", None) or "").strip()
+
     return render(
         "chat.md.j2",
         system_prompt=gen.system_prompt.strip(),
@@ -343,6 +345,7 @@ def _render_prompt(
         summary=summary or "",
         grounding_mode=mode,
         refusal_instruction=refusal_instruction,
+        voice_footer=voice_footer,
     )
 
 

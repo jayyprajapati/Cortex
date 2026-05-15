@@ -201,6 +201,7 @@ class TaskOverride(BaseModel):
     max_retries: Optional[int] = None
     grounding_mode: Optional[Literal["strict", "truthful", "off"]] = None
     max_context_tokens: Optional[int] = None
+    voice_footer: Optional[str] = None
 
     @field_validator("temperature")
     @classmethod

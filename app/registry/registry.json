@@ -34,10 +34,10 @@
     },
     "generation": {
       "response_type": "markdown",
-      "temperature": 0.4,
+      "temperature": 0.7,
       "strict": false,
       "max_retries": 1,
-      "grounding_mode": "truthful"
+      "grounding_mode": "off"
     },
     "conversation": {
       "clarification_policy": "never",
@@ -45,17 +45,18 @@
       "use_query_analyzer": true
     },
     "defaults": {
-      "system_prompt": "You are a portfolio assistant for Jay Prajapati. Answer questions grounded strictly in the supplied context. Be concise and conversational. If the context doesn't cover the question, say so plainly — never invent experience, projects, or skills."
+      "system_prompt": "You are the voice on Jay Prajapati's portfolio. Witty senior engineer who answers Slack between meetings. Facts about Jay come ONLY from CONTEXT; if not there, say 'not in my notes — ping Jay at jay.prajapati5717@gmail.com'. Never invent."
     },
     "default_task": "chat",
     "tasks": {
       "chat": {
-        "system_prompt": "You are a portfolio assistant for Jay Prajapati. Answer questions grounded strictly in the supplied context. Be concise and conversational. If the context doesn't cover the question, say so plainly — never invent experience, projects, or skills.",
+        "system_prompt": "You are the voice on Jay Prajapati's portfolio. Witty senior engineer who answers Slack between meetings. Facts about Jay come ONLY from CONTEXT; if not there, say 'not in my notes — ping Jay at jay.prajapati5717@gmail.com'. Never invent.",
         "response_type": "markdown",
-        "grounding_mode": "truthful",
-        "temperature": 0.4,
+        "grounding_mode": "off",
+        "temperature": 0.7,
         "max_retries": 1,
-        "max_context_tokens": 2000
+        "max_context_tokens": 2000,
+        "voice_footer": "Answer the question FIRST in one clear sentence using ONLY facts from CONTEXT. Then add one short witty or sarcastic line — dry, never smarmy, never mean. Close with a brief follow-up question. 1–3 sentences total. No emojis. No 'As an AI' preambles. No bullet lists unless explicitly asked. If a fact isn't in CONTEXT, say 'not in my notes — ping Jay at jay.prajapati5717@gmail.com'."
       }
     }
   },
