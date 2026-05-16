@@ -102,6 +102,20 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------------------------
+# Sentry error tracking (opt-in via SENTRY_DSN env var)
+# ---------------------------------------------------------------------------
+_sentry_dsn = os.getenv("SENTRY_DSN")
+if _sentry_dsn:
+    import sentry_sdk
+    from sentry_sdk.integrations.fastapi import FastApiIntegration
+    from sentry_sdk.integrations.starlette import StarletteIntegration
+    sentry_sdk.init(
+        dsn=_sentry_dsn,
+        integrations=[StarletteIntegration(), FastApiIntegration()],
+        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+    )
+
+# ---------------------------------------------------------------------------
 # Security middleware stack
 #
 # NOTE ON HEADER-BASED SECURITY SCOPE
@@ -178,6 +192,26 @@ class RequestContextMiddleware(_BaseHTTPMiddleware):
         return response
 
 app.add_middleware(RequestContextMiddleware)
+
+# ---------------------------------------------------------------------------
+# Prometheus request timing middleware
+# ---------------------------------------------------------------------------
+import time as _time_mod
+from app.observability.metrics import request_count, request_latency
+
+class PrometheusMiddleware(_BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next) -> _Response:
+        route = request.url.path
+        method = request.method
+        t0 = _time_mod.monotonic()
+        response = await call_next(request)
+        duration = _time_mod.monotonic() - t0
+        status = str(response.status_code)
+        request_count.labels(route=route, method=method, status=status).inc()
+        request_latency.labels(route=route).observe(duration)
+        return response
+
+app.add_middleware(PrometheusMiddleware)
 
 # ---------------------------------------------------------------------------
 # Rate limiting (slowapi)
@@ -323,6 +357,14 @@ def get_auth_session(request: Request):
     """
     user_id = request.state.user_id
     return issue_session_token(user_id)
+
+
+@app.get("/metrics", dependencies=[Depends(require_admin_key)])
+def metrics_endpoint():
+    """Prometheus metrics endpoint (admin-key gated)."""
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    from fastapi.responses import Response as _MetricsResponse
+    return _MetricsResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/health")
