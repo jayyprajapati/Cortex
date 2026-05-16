@@ -13,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.applications import router as applications_router
 from app.api.collections import router as collections_router
@@ -40,6 +41,7 @@ from app.threads import (
 from app.threads.summarize import KEEP_RECENT, SUMMARIZE_AFTER, summarize_old_turns
 from app.vectorstore.qdrant_store import delete_document_vectors, delete_user_vectors
 from cortex.middleware.docs_block import BlockDocsInProduction
+from cortex.middleware.origin import OriginRefererMiddleware, _ALLOWED_ORIGINS as _CORS_ORIGINS
 from cortex.core.resume_extractor import extract_resume
 from cortex.core.profile_normalizer import merge_profiles
 from cortex.core.resume_optimizer import analyze_match, generate_document
@@ -81,12 +83,47 @@ app = FastAPI(
     **({"docs_url": None, "redoc_url": None, "openapi_url": None} if not _is_dev else {}),
 )
 
+# ---------------------------------------------------------------------------
+# Security middleware stack
+#
+# NOTE ON HEADER-BASED SECURITY SCOPE
+# Header-based checks (CORS, Origin/Referer pinning, TrustedHost) block browsers
+# and casual scripted abuse, not a determined attacker with a proxy.
+# Real security boundary is JWT (P0.4) + admin key (P0.3).
+#
+# Starlette middleware ordering: the LAST add_middleware call wraps outermost
+# (processes requests first).  Stack from outermost → innermost:
+#   BlockDocsInProduction → TrustedHostMiddleware → OriginRefererMiddleware → CORSMiddleware
+# ---------------------------------------------------------------------------
+
+# CORS — innermost; runs last on requests, first on responses.
+# Allowlist is config-driven via CORS_ALLOWED_ORIGINS env var (comma-separated).
+# If not set, falls back to the hardcoded defaults in cortex/middleware/origin.py.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
+
+# Origin/Referer pinning — blocks browser requests from disallowed origins.
+# Server-to-server requests with no Origin/Referer header are always allowed.
+# Exempt paths: /health, /ready, OPTIONS (pre-flight).
+app.add_middleware(OriginRefererMiddleware)
+
+# TrustedHost — rejects requests with an unexpected Host header.
+# Configured via ALLOWED_HOSTS env var (comma-separated).
+# Default: localhost variants + *.jayprajapati.dev wildcard.
+_raw_allowed_hosts = (os.getenv("ALLOWED_HOSTS") or "").strip()
+_allowed_hosts: list[str] = (
+    [h.strip() for h in _raw_allowed_hosts.split(",") if h.strip()]
+    if _raw_allowed_hosts
+    else ["localhost", "127.0.0.1", "0.0.0.0", "*.jayprajapati.dev"]
+)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts)
+
+# Docs blocker — outermost; hides /docs, /redoc, /openapi.json from non-dev hosts.
 app.add_middleware(BlockDocsInProduction)
 
 
