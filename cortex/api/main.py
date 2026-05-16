@@ -6,7 +6,7 @@ import os
 import tempfile
 from typing import Any, List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 
 logger = logging.getLogger(__name__)
 from fastapi.exceptions import RequestValidationError
@@ -40,6 +40,7 @@ from app.threads import (
 )
 from app.threads.summarize import KEEP_RECENT, SUMMARIZE_AFTER, summarize_old_turns
 from app.vectorstore.qdrant_store import delete_document_vectors, delete_user_vectors
+from cortex.middleware.admin_key import require_admin_key
 from cortex.middleware.docs_block import BlockDocsInProduction
 from cortex.middleware.origin import OriginRefererMiddleware, _ALLOWED_ORIGINS as _CORS_ORIGINS
 from cortex.core.resume_extractor import extract_resume
@@ -219,8 +220,8 @@ class ReindexRequest(BaseModel):
 # Routers
 # ---------------------------------------------------------------------------
 
-app.include_router(applications_router)
-app.include_router(collections_router)
+app.include_router(applications_router, dependencies=[Depends(require_admin_key)])
+app.include_router(collections_router, dependencies=[Depends(require_admin_key)])
 
 
 # ---------------------------------------------------------------------------
@@ -1238,7 +1239,7 @@ def compose_rewrite_endpoint(payload: RewriteRequest):
     return RewriteResponse(**result)
 
 
-@app.post("/admin/reindex")
+@app.post("/admin/reindex", dependencies=[Depends(require_admin_key)])
 def admin_reindex_endpoint(payload: ReindexRequest):
     """
     POST /admin/reindex
