@@ -37,6 +37,8 @@ class EffectiveGenerationConfig:
     grounding_mode: GroundingMode = "off"
     max_context_tokens: int = 4000
     voice_footer: Optional[str] = None
+    citation_validation: bool = False
+    citation_threshold: float = 0.7
 
 
 @dataclass

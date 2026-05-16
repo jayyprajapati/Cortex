@@ -90,6 +90,7 @@ class RetrievalConfig(BaseModel):
     expand_neighbors: bool = True
     neighbor_budget_tokens: int = 400
     confidence_min_score: float = 0.25
+    score_threshold: float = 0.0
     metadata_filter: Optional[Dict[str, Any]] = None
 
     @field_validator("top_k")

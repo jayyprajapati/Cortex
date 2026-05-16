@@ -118,11 +118,12 @@ def _normalize_schema(schema: Optional[Dict]) -> Optional[Dict]:
 
 def _build_context_str(chunks: List[dict], max_context_tokens: int = 4000) -> str:
     # Drop lowest-ranked chunks (end of list) until the context fits in the budget.
-    # Token estimate: len(text) // 4 (fast, no tiktoken dependency).
+    # Use tiktoken for accurate token counting.
+    from app.chunking.tokenizer import token_count
     budget = max_context_tokens
     kept: List[dict] = []
     for chunk in chunks:
-        cost = len(str(chunk.get("text") or "")) // 4
+        cost = token_count(str(chunk.get("text") or ""))
         if cost > budget and kept:
             break
         kept.append(chunk)
@@ -185,6 +186,35 @@ def extract_citations(answer_text: str, sources: List[dict]) -> List[Dict[str, A
             "text": src.get("text"),
         })
     return citations
+
+
+def _validate_citations(answer_text: str, num_sources: int, threshold: float = 0.7) -> dict:
+    """Validate [N] citation markers in markdown answer.
+
+    Returns: {valid: bool, coverage: float, out_of_range: list[int]}
+    - coverage: fraction of sentences with at least one [N] citation
+    - out_of_range: [N] values that exceed num_sources
+    """
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", answer_text) if s.strip()]
+    if not sentences:
+        return {"valid": True, "coverage": 1.0, "out_of_range": []}
+
+    cited_count = sum(1 for s in sentences if _CITATION_RE.search(s))
+    coverage = cited_count / len(sentences)
+
+    out_of_range = []
+    for match in _CITATION_RE.finditer(answer_text):
+        for piece in match.group(1).split(","):
+            try:
+                idx = int(piece.strip())
+                if idx < 1 or idx > num_sources:
+                    out_of_range.append(idx)
+            except ValueError:
+                pass
+    out_of_range = sorted(set(out_of_range))
+
+    valid = coverage >= threshold and not out_of_range
+    return {"valid": valid, "coverage": round(coverage, 3), "out_of_range": out_of_range}
 
 
 def _build_public_sources(chunks: List[dict]) -> List[dict]:
@@ -616,17 +646,14 @@ def generate_answer(
     context_str = _build_context_str(chunks, max_context_tokens=gen.max_context_tokens)
 
     if not context_str.strip():
-        # No context — LLM responds naturally (no hardcoded refusal)
-        no_context_prompt = _render_prompt(query, "", gen, history=chat_history, summary=summary)
-        llm = get_llm(ctx.llm_config)
-        answer = llm.generate(no_context_prompt, temperature=gen.temperature)
         return {
-            "answer": str(answer or "").strip(),
+            "answer": "I don't have enough information in my knowledge base to answer this question.",
             "grounded": False,
             "sources": [],
+            "confidence": "low",
             "meta": {
-                "retrieved_count": 0,
-                "reranked_count": 0,
+                "retrieved_count": retrieval_result.retrieved_count,
+                "reranked_count": retrieval_result.reranked_count,
                 "retrieve_ms": round(retrieve_ms, 1),
                 "generate_ms": 0,
             },
@@ -637,6 +664,37 @@ def generate_answer(
     t0 = time.monotonic()
     answer = generate_with_output_contract(llm, prompt, gen)
     generate_ms = (time.monotonic() - t0) * 1000
+
+    # P1.1: Citation validation (markdown only, when enabled)
+    citation_confidence_low = False
+    if gen.response_type == "markdown" and getattr(gen, "citation_validation", False):
+        citation_result = _validate_citations(
+            str(answer), len(chunks), threshold=getattr(gen, "citation_threshold", 0.7)
+        )
+        if not citation_result["valid"]:
+            correction = (
+                f"Your previous answer had citation issues "
+                f"(coverage: {citation_result['coverage']:.0%}, "
+                f"out-of-range: {citation_result['out_of_range']}). "
+                f"Please rewrite with [N] citations for every factual claim, "
+                f"where N is 1-{len(chunks)}.\n\n"
+                f"Original question: {query}\n\nAnswer:"
+            )
+            t_corr = time.monotonic()
+            corrected = llm.generate(correction, temperature=gen.temperature)
+            generate_ms += (time.monotonic() - t_corr) * 1000
+            corrected_text = str(corrected or "").strip()
+            if corrected_text:
+                answer = corrected_text
+            citation_result2 = _validate_citations(
+                str(answer), len(chunks), threshold=getattr(gen, "citation_threshold", 0.7)
+            )
+            if not citation_result2["valid"]:
+                logger.warning(
+                    "Citation validation still failing after correction: coverage=%.2f out_of_range=%s",
+                    citation_result2["coverage"], citation_result2["out_of_range"],
+                )
+                citation_confidence_low = True
 
     cortex_logger.log_generate(
         app_name=ctx.app_name,
@@ -649,9 +707,21 @@ def generate_answer(
 
     grounding = _check_grounding(answer, chunks, mode)
     if mode == "strict" and not grounding["grounded"]:
-        # In strict mode with grounding failure: let LLM rephrase naturally
         logger.warning("Strict grounding failed: unverified=%s", grounding["unverified"][:5])
-        # Don't replace with hardcoded string — just log and return as-is (grounded=False signals this to caller)
+        correction = (
+            f"Your previous answer contained unverified claims: {grounding['unverified'][:5]}. "
+            f"Rewrite the answer removing or correcting any claim not supported by the provided sources. "
+            f"If you cannot answer without those claims, say 'I don't have enough information.'\n\n"
+            f"Original question: {query}\n\nAnswer:"
+        )
+        t_corr = time.monotonic()
+        corrected = llm.generate(correction, temperature=gen.temperature)
+        generate_ms += (time.monotonic() - t_corr) * 1000
+        answer = str(corrected or "").strip() or answer
+        grounding = _check_grounding(answer, chunks, mode)
+        if not grounding["grounded"]:
+            answer = "I don't have enough information in the provided sources to answer this question accurately."
+            grounding = {"grounded": False, "unverified": grounding["unverified"]}
 
     meta: Dict[str, Any] = {
         "retrieved_count": retrieval_result.retrieved_count,
@@ -661,6 +731,8 @@ def generate_answer(
     }
     if grounding["unverified"]:
         meta["unverified_entities"] = grounding["unverified"]
+    if citation_confidence_low:
+        meta["confidence"] = "low"
 
     return {
         "answer": answer,

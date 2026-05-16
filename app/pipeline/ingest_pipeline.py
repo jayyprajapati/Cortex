@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 import uuid
@@ -20,8 +21,20 @@ def resolve_doc_id(doc_id) -> str:
 def ingest_document(ctx: ExecutionContext, path: str, doc_id: str) -> dict:
     """Ingest a file at the given path using ctx.components.loader."""
     loader = ctx.components.loader
+
+    # If no meaningful doc_id was provided, derive one from file content (sha256)
+    # so that re-ingesting the same file is idempotent (upsert overwrites cleanly).
+    resolved_id = doc_id
+    if not doc_id or not str(doc_id).strip():
+        try:
+            with open(path, "rb") as fh:
+                file_bytes = fh.read()
+            resolved_id = hashlib.sha256(file_bytes).hexdigest()[:16]
+        except OSError:
+            resolved_id = str(uuid.uuid4())
+
     elements = loader.load(path)
-    return _ingest_elements(ctx, elements, doc_id)
+    return _ingest_elements(ctx, elements, resolved_id)
 
 
 def ingest_text(ctx: ExecutionContext, text: str, doc_id: str) -> dict:
@@ -124,7 +137,7 @@ def _ingest_elements(ctx: ExecutionContext, elements, doc_id: str) -> dict:
             source_app=getattr(chunk, "source_app", None),
         )
         batch_points.append({
-            "point_id": str(uuid.uuid4()),
+            "point_id": str(uuid.uuid5(uuid.NAMESPACE_OID, f"{doc_id}:{chunk.chunk_id}")),
             "vector": list(dense_vec) if hasattr(dense_vec, "__iter__") else dense_vec,
             "sparse_vector": sparse_vec,
             "payload": payload,

@@ -156,6 +156,26 @@ def run_retrieval(
         merged = merged[:retrieval_cfg.top_k]
         reranked_count = len(merged)
 
+    # Step 5b: Score threshold filter
+    score_threshold = getattr(retrieval_cfg, "score_threshold", 0.0)
+    if score_threshold > 0.0:
+        before_filter = len(merged)
+        merged = [
+            c for c in merged
+            if (c.get("rerank_score") if c.get("rerank_score") is not None else c.get("score", 0.0)) >= score_threshold
+        ]
+        if len(merged) < before_filter:
+            logger.info(
+                "Score threshold %.3f dropped %d/%d chunks",
+                score_threshold, before_filter - len(merged), before_filter,
+            )
+        if not merged:
+            return RetrievalResult(
+                retrieved_count=retrieved_count,
+                reranked_count=0,
+                rerank_latency_ms=round(rerank_ms, 1),
+            )
+
     # Step 6: Neighbor expansion
     if retrieval_cfg.expand_neighbors:
         from app.retrieval.neighbor_expansion import expand_neighbors
