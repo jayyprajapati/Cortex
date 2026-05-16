@@ -7,6 +7,9 @@ import tempfile
 from typing import Any, List, Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 logger = logging.getLogger(__name__)
 from fastapi.exceptions import RequestValidationError
@@ -144,6 +147,27 @@ app.add_middleware(RequestNonceMiddleware)
 # unset, tokens are decoded without signature verification (insecure, dev only).
 app.add_middleware(JWTAuthMiddleware)
 
+# ---------------------------------------------------------------------------
+# Rate limiting (slowapi)
+#
+# Keyed by JWT sub (request.state.user_id) so limits are per-user, not per-IP.
+# Falls back to IP for unauthenticated paths (health/ready).
+# In-memory storage — sufficient for single-process deployments.
+# ---------------------------------------------------------------------------
+
+
+def _get_user_id_for_rate_limit(request: Request) -> str:
+    """Key rate limits by JWT sub, fall back to IP."""
+    user_id = getattr(request.state, "user_id", None)
+    if user_id:
+        return user_id
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=_get_user_id_for_rate_limit)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 
 _LLM_ERROR_MARKERS = (
     "llm provider", "llm extraction failed", "llm generation failed",
@@ -269,6 +293,39 @@ def get_auth_session(request: Request):
     return issue_session_token(user_id)
 
 
+@app.get("/health")
+def health():
+    """Liveness probe — always returns 200 if the process is up."""
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    """Readiness check: verifies Qdrant connectivity and LLM provider config."""
+    errors = []
+
+    # Check Qdrant
+    try:
+        from app.config import get_qdrant_client
+        client = get_qdrant_client()
+        client.get_collections()  # lightweight ping
+    except Exception as e:
+        errors.append(f"qdrant: {e}")
+
+    # Check LLM provider config
+    from app.config import LLM_PROVIDER, OPENAI_API_KEY, OLLAMA_CLOUD_API_KEY
+    provider = LLM_PROVIDER or ""
+    if provider == "openai" and not OPENAI_API_KEY:
+        errors.append("openai: OPENAI_API_KEY not set")
+    elif provider == "ollama_cloud" and not OLLAMA_CLOUD_API_KEY:
+        errors.append("ollama_cloud: OLLAMA_CLOUD_API_KEY not set")
+    # ollama_local has no key requirement
+
+    if errors:
+        return JSONResponse(status_code=503, content={"status": "not ready", "errors": errors})
+    return {"status": "ready"}
+
+
 @app.post("/llm/ping")
 def llm_ping_endpoint(payload: LLMPingRequest):
     """
@@ -302,6 +359,7 @@ def llm_ping_endpoint(payload: LLMPingRequest):
 
 
 @app.post("/ingest")
+@limiter.limit("30/minute")
 async def ingest_endpoint(request: Request):
     content_type = (request.headers.get("content-type") or "").lower()
     uploaded_file = None
@@ -391,6 +449,7 @@ async def ingest_endpoint(request: Request):
 
 
 @app.post("/generate")
+@limiter.limit("30/minute")
 async def generate_only_endpoint(request: Request, stream: bool = False):
     try:
         body = await request.json()
@@ -464,6 +523,7 @@ def _auto_title(query: str) -> str:
 
 
 @app.post("/chat")
+@limiter.limit("30/minute")
 async def chat_endpoint(request: Request, stream: bool = True):
     """
     POST /chat
@@ -791,6 +851,7 @@ def delete_all_documents_endpoint(request: Request, payload: DeleteAllRequest):
 
 
 @app.post("/extract", response_model=ExtractResponse)
+@limiter.limit("30/minute")
 async def extract_endpoint(request: Request):
     """
     POST /extract
@@ -990,6 +1051,7 @@ def profile_merge_endpoint(request: Request, payload: ProfileMergeRequest):
 
 
 @app.post("/analyze/match", response_model=MatchResponse)
+@limiter.limit("30/minute")
 def analyze_match_endpoint(request: Request, payload: MatchRequest):
     """
     POST /analyze/match
@@ -1063,6 +1125,7 @@ def analyze_match_endpoint(request: Request, payload: MatchRequest):
 
 
 @app.post("/generate/document", response_model=DocumentResponse)
+@limiter.limit("30/minute")
 def generate_document_endpoint(request: Request, payload: DocumentRequest):
     """
     POST /generate/document
