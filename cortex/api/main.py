@@ -610,69 +610,88 @@ async def chat_endpoint(request: Request, stream: bool = True):
             citations_list = []
             event_type_received = None
             was_clarification = False
+            # Track whether we successfully marked clarification pending so that the
+            # finally block can clear it on crash or client disconnection.
+            _clarification_marked = False
             try:
-                async for event_str in stream_answer(
-                    ctx=ctx,
-                    query=query,
-                    chat_history=chat_history,
-                    summary=summary,
-                    clarification_reply=clarification_reply,
-                ):
-                    yield event_str
-                    # Parse emitted events to extract answer + citations for thread storage
-                    import json as _json
-                    try:
-                        # SSE events are "event: TYPE\ndata: JSON\n\n"
-                        for line in event_str.split("\n"):
-                            if line.startswith("event: "):
-                                event_type_received = line[7:].strip()
-                            elif line.startswith("data: "):
-                                data = _json.loads(line[6:])
-                                if event_type_received == "delta":
-                                    full_answer_parts.append(data.get("text", ""))
-                                elif event_type_received == "clarification":
-                                    full_answer_parts.append(data.get("text", ""))
-                                    was_clarification = True
-                                elif event_type_received == "citations":
-                                    citations_list = data.get("citations", [])
-                    except Exception:
-                        pass
-            except Exception as exc:
-                yield error_event(str(exc), code="stream_error")
-
-            # Persist thread messages after stream completes
-            try:
-                full_answer = "".join(full_answer_parts)
-                append_message(thread["id"], "user", query)
-                append_message(
-                    thread["id"],
-                    "assistant",
-                    full_answer,
-                    citations=citations_list or None,
-                    grounded=False,
-                )
-                if was_clarification:
-                    from app.conversation.state import mark_clarification_pending
-                    from app.conversation.clarification import build_clarification_context
-                    mark_clarification_pending(thread["id"], build_clarification_context({}, query))
-                # Rolling summarization (best-effort)
-                total = count_messages(thread["id"])
-                summarized_up_to = int(thread.get("summary_up_to_message_idx") or 0)
-                from app.conversation.history import should_summarize
-                if should_summarize(total, summarized_up_to):
-                    all_msgs = get_thread_with_messages(thread["id"])["messages"]
-                    cutoff = total - KEEP_RECENT
-                    to_summarize = all_msgs[summarized_up_to:cutoff]
-                    if to_summarize:
+                try:
+                    async for event_str in stream_answer(
+                        ctx=ctx,
+                        query=query,
+                        chat_history=chat_history,
+                        summary=summary,
+                        clarification_reply=clarification_reply,
+                    ):
+                        yield event_str
+                        # Parse emitted events to extract answer + citations for thread storage
+                        import json as _json
                         try:
-                            llm_inst = get_llm(ctx.llm_config)
-                            new_summary = summarize_old_turns(to_summarize, summary, llm_inst)
-                            if new_summary:
-                                update_summary(thread["id"], new_summary, cutoff)
+                            # SSE events are "event: TYPE\ndata: JSON\n\n"
+                            for line in event_str.split("\n"):
+                                if line.startswith("event: "):
+                                    event_type_received = line[7:].strip()
+                                elif line.startswith("data: "):
+                                    data = _json.loads(line[6:])
+                                    if event_type_received == "delta":
+                                        full_answer_parts.append(data.get("text", ""))
+                                    elif event_type_received == "clarification":
+                                        full_answer_parts.append(data.get("text", ""))
+                                        was_clarification = True
+                                    elif event_type_received == "citations":
+                                        citations_list = data.get("citations", [])
                         except Exception:
                             pass
-            except Exception as exc:
-                logger.warning("Post-stream thread persistence failed: %s", exc)
+                except Exception as exc:
+                    yield error_event(str(exc), code="stream_error")
+
+                # Persist thread messages after stream completes
+                try:
+                    full_answer = "".join(full_answer_parts)
+                    append_message(thread["id"], "user", query)
+                    append_message(
+                        thread["id"],
+                        "assistant",
+                        full_answer,
+                        citations=citations_list or None,
+                        grounded=False,
+                    )
+                    if was_clarification:
+                        from app.conversation.state import mark_clarification_pending
+                        from app.conversation.clarification import build_clarification_context
+                        mark_clarification_pending(thread["id"], build_clarification_context({}, query))
+                        _clarification_marked = True
+                    # Rolling summarization (best-effort)
+                    total = count_messages(thread["id"])
+                    summarized_up_to = int(thread.get("summary_up_to_message_idx") or 0)
+                    from app.conversation.history import should_summarize
+                    if should_summarize(total, summarized_up_to):
+                        all_msgs = get_thread_with_messages(thread["id"])["messages"]
+                        cutoff = total - KEEP_RECENT
+                        to_summarize = all_msgs[summarized_up_to:cutoff]
+                        if to_summarize:
+                            try:
+                                llm_inst = get_llm(ctx.llm_config)
+                                new_summary = summarize_old_turns(to_summarize, summary, llm_inst)
+                                if new_summary:
+                                    update_summary(thread["id"], new_summary, cutoff)
+                            except Exception as summ_exc:
+                                logger.warning("Summarization failed (best-effort): %s", summ_exc)
+                except Exception as exc:
+                    logger.warning("Post-stream thread persistence failed: %s", exc)
+            finally:
+                # On abrupt teardown (GeneratorExit from client disconnect or unhandled
+                # exception), clear any stale clarification-pending flag so it does not
+                # persist across future requests for this thread.  Two cases:
+                #   1. _clarification_marked=True  → we set the flag intentionally just
+                #      before teardown; leave it (next request will clear it normally).
+                #   2. _clarification_marked=False → flag was never set in this request,
+                #      but a previous stuck flag may still be live; clear it defensively.
+                if not _clarification_marked:
+                    try:
+                        from app.conversation.state import clear_clarification_pending
+                        clear_clarification_pending(thread["id"])
+                    except Exception:
+                        pass
 
         return make_sse_response(_sse_generator())
 
@@ -1194,6 +1213,7 @@ def generate_document_endpoint(request: Request, payload: DocumentRequest):
             include_external_keywords=payload.include_external_keywords,
             remove_irrelevant_keywords=payload.remove_irrelevant_keywords,
             aggressiveness=payload.aggressiveness,
+            fabrication_check=payload.fabrication_check,
         )
     except ValueError as exc:
         raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc

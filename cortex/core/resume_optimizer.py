@@ -631,6 +631,71 @@ def _format_source_resume(source_resume_content: Dict[str, Any]) -> str:
     return "\n\n".join(lines) if lines else "No source resume content provided."
 
 
+def _flatten_profile_to_string(canonical_profile: Dict[str, Any]) -> str:
+    """Recursively flatten all string values in the canonical profile to one text blob."""
+    parts: List[str] = []
+
+    def _collect(obj: Any) -> None:
+        if isinstance(obj, str):
+            parts.append(obj)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                _collect(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _collect(item)
+        elif obj is not None:
+            parts.append(str(obj))
+
+    _collect(canonical_profile)
+    return " ".join(parts)
+
+
+def _extract_verifiable_tokens(text: str) -> Set[str]:
+    """
+    Extract proper nouns (capitalized words), 4-digit years, and standalone numbers
+    from generated text.  Returns a set of lower-cased tokens for comparison.
+    """
+    tokens: Set[str] = set()
+    # 4-digit years (e.g. 2019, 2024)
+    for m in re.finditer(r'\b(\d{4})\b', text):
+        tokens.add(m.group(1))
+    # Other standalone numbers (e.g. "50%", "12 engineers")
+    for m in re.finditer(r'\b(\d+)\b', text):
+        tokens.add(m.group(1))
+    # Capitalized words that are not sentence-starters (heuristic: preceded by space/punctuation)
+    for m in re.finditer(r'(?<=[^\.\!\?\n])\s+([A-Z][a-zA-Z]{2,})', text):
+        tokens.add(m.group(1).lower())
+    # Also grab all-caps acronyms 2+ chars (AWS, GCP, SQL …)
+    for m in re.finditer(r'\b([A-Z]{2,})\b', text):
+        tokens.add(m.group(1).lower())
+    return tokens
+
+
+def _check_fabrication(
+    result: Dict[str, Any],
+    canonical_profile: Dict[str, Any],
+) -> List[str]:
+    """
+    Return a list of tokens present in the generated document that cannot be
+    found anywhere in the canonical profile string (case-insensitive).
+    An empty list means no fabrication was detected.
+    """
+    # Serialize just the text-bearing fields of the result
+    generated_text = json.dumps(result, ensure_ascii=False)
+    profile_blob = _flatten_profile_to_string(canonical_profile).lower()
+
+    tokens = _extract_verifiable_tokens(generated_text)
+    unverified: List[str] = []
+    for token in sorted(tokens):
+        # Skip very short numeric tokens (single digits) – too noisy
+        if token.isdigit() and len(token) <= 1:
+            continue
+        if token not in profile_blob:
+            unverified.append(token)
+    return unverified
+
+
 def generate_document(
     job_description: str,
     canonical_profile: Dict[str, Any],
@@ -650,6 +715,7 @@ def generate_document(
     include_external_keywords: bool = False,
     remove_irrelevant_keywords: bool = True,
     aggressiveness: str = "balanced",
+    fabrication_check: bool = False,
 ) -> Dict[str, Any]:
     """
     Generate structured, ATS-optimized resume content blocks.
@@ -764,6 +830,52 @@ def generate_document(
                 reason = item.get("reason") or ""
                 coerced.append(f"{name} ({reason})" if reason else name)
         result["removed_content"] = coerced
+
+    # Fabrication check — verify that proper nouns, years, and numbers in the
+    # generated output are grounded in the canonical profile.
+    if fabrication_check:
+        unverified = _check_fabrication(result, canonical_profile)
+        if unverified:
+            logger.warning(
+                "fabrication_check: %d unverified token(s) found on first pass: %s",
+                len(unverified), unverified[:20],
+            )
+            # One correction retry
+            correction_suffix = (
+                "\n\nCORRECTION REQUIRED: The previous output contained skills, companies, "
+                "dates, or metrics that may not appear in the candidate's profile. "
+                "Remove any invented content. "
+                "Return ONLY skills, companies, dates, and numbers that are explicitly "
+                "present in the canonical profile provided above."
+            )
+            retry_prompt = prompt + correction_suffix
+            try:
+                result = _call_llm_structured(
+                    retry_prompt, schema, llm_config, max_retries=1, temperature=temperature
+                )
+                # Re-coerce removed_content after retry
+                rc2 = result.get("removed_content")
+                if isinstance(rc2, list):
+                    coerced2 = []
+                    for item in rc2:
+                        if isinstance(item, str):
+                            coerced2.append(item)
+                        elif isinstance(item, dict):
+                            name = item.get("item") or item.get("name") or item.get("content") or ""
+                            reason = item.get("reason") or ""
+                            coerced2.append(f"{name} ({reason})" if reason else name)
+                    result["removed_content"] = coerced2
+                # Check again after retry
+                still_unverified = _check_fabrication(result, canonical_profile)
+                if still_unverified:
+                    logger.warning(
+                        "fabrication_check: %d token(s) still unverified after correction retry: %s",
+                        len(still_unverified), still_unverified[:20],
+                    )
+                    result["fabrication_warning"] = still_unverified
+            except Exception as exc:
+                logger.warning("fabrication correction retry failed: %s", exc)
+                result["fabrication_warning"] = unverified
 
     result["mode"] = mode
     return result

@@ -256,6 +256,7 @@ class DocumentRequest(BaseModel):
     include_external_keywords: bool = False
     remove_irrelevant_keywords: bool = True
     aggressiveness: Literal["conservative", "balanced", "aggressive"] = "balanced"
+    fabrication_check: bool = False
 
 
 class DocumentResponse(BaseModel):
