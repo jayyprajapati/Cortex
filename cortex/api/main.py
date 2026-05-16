@@ -39,6 +39,7 @@ from app.threads import (
 )
 from app.threads.summarize import KEEP_RECENT, SUMMARIZE_AFTER, summarize_old_turns
 from app.vectorstore.qdrant_store import delete_document_vectors, delete_user_vectors
+from cortex.middleware.docs_block import BlockDocsInProduction
 from cortex.core.resume_extractor import extract_resume
 from cortex.core.profile_normalizer import merge_profiles
 from cortex.core.resume_optimizer import analyze_match, generate_document
@@ -70,14 +71,14 @@ from cortex.schemas.resumelab import (
     RewriteResponse,
 )
 
-_env = os.getenv("APP_ENV") or os.getenv("ENV") or os.getenv("PYTHON_ENV") or "development"
-_is_prod = str(_env).lower() in ("production", "prod")
+_env = os.getenv("APP_ENV") or os.getenv("ENV") or os.getenv("PYTHON_ENV") or ""
+_is_dev = str(_env).lower() in ("dev", "development", "local")
 
 app = FastAPI(
     title="Cortex RAG Engine",
     description="Registry-driven multi-application RAG orchestration",
     version="2.0.0",
-    **({"docs_url": None, "redoc_url": None, "openapi_url": None} if _is_prod else {}),
+    **({"docs_url": None, "redoc_url": None, "openapi_url": None} if not _is_dev else {}),
 )
 
 app.add_middleware(
@@ -86,6 +87,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(BlockDocsInProduction)
 
 
 _LLM_ERROR_MARKERS = (
