@@ -23,7 +23,8 @@ def generate_hypothetical_doc(ctx: ExecutionContext, query: str) -> str:
     try:
         from app.llm.factory import get_llm
         llm = get_llm(ctx.llm_config)
-        hypothesis = llm.generate(_HYDE_PROMPT.format(query=query), temperature=0.7)
+        hyde_temp = getattr(ctx.registry.retrieval, "hyde_temperature", 0.7)
+        hypothesis = llm.generate(_HYDE_PROMPT.format(query=query), temperature=hyde_temp)
         return str(hypothesis or "").strip() or query
     except Exception as exc:
         logger.debug("HyDE generation failed (non-fatal): %s", exc)

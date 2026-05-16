@@ -20,7 +20,7 @@ from app.registry.service import _resolve_llm_config
 # ---------------------------------------------------------------------------
 
 _EXTRACT_CACHE: Dict[str, Dict[str, Any]] = {}
-_MAX_EXTRACT_CACHE = 50
+_MAX_EXTRACT_CACHE = int(os.getenv("RESUME_EXTRACT_CACHE_SIZE", "50"))
 
 
 def _extract_cache_key(raw_text: str, extraction_type: str) -> str:
@@ -297,7 +297,7 @@ def extract_resume(
 
     prompt = _EXTRACT_PROMPT.format(
         extraction_type=extraction_type,
-        text=raw_text[:8000],
+        text=raw_text[:int(os.getenv("RESUMELAB_MAX_TEXT_CHARS", "8000"))],
     )
 
     max_retries = 3

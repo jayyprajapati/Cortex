@@ -91,11 +91,14 @@ class RetrievalConfig(BaseModel):
     top_k: int = 10
     fusion: Literal["rrf", "alpha"] = "rrf"
     alpha: float = 0.5
+    rrf_k: int = 60
     query_rewrite: bool = True
     hyde: bool = False
+    hyde_temperature: float = 0.7
     expand_neighbors: bool = True
     neighbor_budget_tokens: int = 400
     confidence_min_score: float = 0.25
+    confidence_high: float = 0.7
     score_threshold: float = 0.0
     metadata_filter: Optional[Dict[str, Any]] = None
 
@@ -160,6 +163,7 @@ class GenerationConfig(BaseModel):
     strict: bool = False
     max_retries: int = 2
     grounding_mode: Literal["strict", "truthful", "off"] = "off"
+    grounding_unverified_threshold: float = 0.15
     max_context_tokens: int = 4000
 
     @field_validator("temperature")
@@ -183,6 +187,10 @@ class ConversationConfig(BaseModel):
     summary_threshold: int = 12
     use_query_analyzer: bool = True
     analyzer_model_override: Optional[str] = None
+    analyzer_temperature: float = 0.0
+    keep_recent: int = 10
+    summarize_after: int = 12
+    auto_title_max_words: int = 8
 
 
 class ApplicationDefaults(BaseModel):

@@ -9,17 +9,18 @@ unresolved questions.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
 # Window of most-recent messages we always keep verbatim in the prompt.
 # Anything older than this gets folded into the summary.
-KEEP_RECENT = 10
+KEEP_RECENT = int(os.getenv("KEEP_RECENT", "10"))
 
 # Trigger summarization once total messages exceeds this number AND we have
 # at least KEEP_RECENT + SUMMARIZE_AFTER unsummarized messages to compress.
-SUMMARIZE_AFTER = 10
+SUMMARIZE_AFTER = int(os.getenv("SUMMARIZE_AFTER", "10"))
 
 _SUMMARY_PROMPT = """\
 You are a conversation summarizer. Compress the conversation below into a 3-5 sentence summary.

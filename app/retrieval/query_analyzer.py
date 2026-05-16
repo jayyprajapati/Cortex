@@ -61,7 +61,8 @@ def analyze_query(
     try:
         from app.llm.factory import get_llm
         llm = get_llm(ctx.llm_config)
-        raw = llm.generate(prompt, temperature=0.0)
+        analyzer_temp = getattr(ctx.registry.conversation, "analyzer_temperature", 0.0)
+        raw = llm.generate(prompt, temperature=analyzer_temp)
         # Parse JSON from response
         raw = str(raw or "").strip()
         # Strip code fences if present

@@ -183,7 +183,11 @@ def run_retrieval(
 
     # Step 7: Confidence
     from app.retrieval.confidence import compute_confidence
-    confidence = compute_confidence(merged, min_score=retrieval_cfg.confidence_min_score)
+    confidence = compute_confidence(
+        merged,
+        min_score=retrieval_cfg.confidence_min_score,
+        high_score=getattr(retrieval_cfg, "confidence_high", 0.7),
+    )
 
     total_ms = (time.monotonic() - t0) * 1000
     discovered_doc_ids = sorted({str(c["doc_id"]) for c in merged if c.get("doc_id")})

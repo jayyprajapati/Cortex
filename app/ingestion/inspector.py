@@ -1,3 +1,4 @@
+import os
 import fitz
 # This module provides functions to inspect documents and extract metadata such as the number of pages, images, and text length. 
 # To determine the complexity of a document, we can analyze the number of pages, images, and the length of the text. 
@@ -19,12 +20,13 @@ def inspect_pdf(path):
         "text_length": text_length
     }
 
+_IMAGE_THRESHOLD = int(os.getenv("INSPECTOR_IMAGE_THRESHOLD", "2"))
+_PAGE_THRESHOLD = int(os.getenv("INSPECTOR_PAGE_THRESHOLD", "30"))
+
+
 def is_complex(meta):
-
-    if meta["images"] > 2:
+    if meta["images"] > _IMAGE_THRESHOLD:
         return True
-
-    if meta["pages"] > 30:
+    if meta["pages"] > _PAGE_THRESHOLD:
         return True
-
     return False

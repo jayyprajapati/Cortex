@@ -642,10 +642,13 @@ async def generate_only_endpoint(request: Request, stream: bool = False):
         return make_sse_response(_gen())
 
 
+_AUTO_TITLE_MAX_WORDS = int(os.getenv("AUTO_TITLE_MAX_WORDS", "8"))
+
+
 def _auto_title(query: str) -> str:
     words = (query or "").strip().split()
-    title = " ".join(words[:8])
-    if len(words) > 8:
+    title = " ".join(words[:_AUTO_TITLE_MAX_WORDS])
+    if len(words) > _AUTO_TITLE_MAX_WORDS:
         title += "…"
     return title or "New chat"
 

@@ -8,10 +8,11 @@ ConfidenceLevel = Literal["high", "medium", "low"]
 def compute_confidence(
     chunks: List[Dict],
     min_score: float = 0.25,
+    high_score: float = 0.7,
 ) -> ConfidenceLevel:
     """
     Derive a confidence level from rerank or retrieval scores.
-    high: top score > 0.7
+    high: top score > high_score
     medium: top score > min_score
     low: no scores or top score <= min_score
     """
@@ -27,7 +28,7 @@ def compute_confidence(
         return "low"
 
     top = max(scores)
-    if top > 0.7:
+    if top > high_score:
         return "high"
     if top > min_score:
         return "medium"

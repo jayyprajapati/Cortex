@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -778,7 +779,7 @@ def generate_document(
         # Build original resume text block for verbatim preservation (4D)
         orig_text = str(original_resume_text or "").strip()
         original_resume_text_block = (
-            f"\n=== ORIGINAL RESUME (preserve verbatim where possible) ===\n{orig_text[:8000]}\n=== END ORIGINAL ===\n"
+            f"\n=== ORIGINAL RESUME (preserve verbatim where possible) ===\n{orig_text[:int(os.getenv('RESUMELAB_MAX_TEXT_CHARS', '8000'))]}\n=== END ORIGINAL ===\n"
             if orig_text else ""
         )
         prompt = _MODIFY_PROMPT.format(

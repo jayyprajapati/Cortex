@@ -39,6 +39,7 @@ class EffectiveGenerationConfig:
     voice_footer: Optional[str] = None
     citation_validation: bool = False
     citation_threshold: float = 0.7
+    grounding_unverified_threshold: float = 0.15
 
 
 @dataclass

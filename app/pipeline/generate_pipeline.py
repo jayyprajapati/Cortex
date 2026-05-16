@@ -288,7 +288,7 @@ def _extract_verifiable_tokens(text: str) -> Dict[str, List[str]]:
     return {"proper_nouns": proper, "years": years, "numbers": numbers}
 
 
-def _check_grounding(answer: Any, chunks: List[dict], mode: str) -> Dict[str, Any]:
+def _check_grounding(answer: Any, chunks: List[dict], mode: str, unverified_threshold: float = 0.15) -> Dict[str, Any]:
     """
     Verify proper nouns and numbers in the answer appear in retrieved chunks.
 
@@ -320,7 +320,7 @@ def _check_grounding(answer: Any, chunks: List[dict], mode: str) -> Dict[str, An
         grounded = len(unverified) == 0
     elif mode == "truthful":
         denom = max(len(tokens["proper_nouns"]) + len(tokens["years"]), 1)
-        grounded = (len(unverified) / denom) < 0.15
+        grounded = (len(unverified) / denom) < unverified_threshold
     else:
         grounded = True
 
@@ -705,7 +705,8 @@ def generate_answer(
         latency_ms=generate_ms,
     )
 
-    grounding = _check_grounding(answer, chunks, mode)
+    _unverified_thresh = getattr(gen, "grounding_unverified_threshold", 0.15)
+    grounding = _check_grounding(answer, chunks, mode, unverified_threshold=_unverified_thresh)
     if mode == "strict" and not grounding["grounded"]:
         logger.warning("Strict grounding failed: unverified=%s", grounding["unverified"][:5])
         correction = (
