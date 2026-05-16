@@ -43,6 +43,7 @@ from app.vectorstore.qdrant_store import delete_document_vectors, delete_user_ve
 from cortex.middleware.admin_key import require_admin_key
 from cortex.middleware.auth import JWTAuthMiddleware
 from cortex.middleware.docs_block import BlockDocsInProduction
+from cortex.middleware.nonce import RequestNonceMiddleware, issue_session_token
 from cortex.middleware.origin import OriginRefererMiddleware, _ALLOWED_ORIGINS as _CORS_ORIGINS
 from cortex.core.resume_extractor import extract_resume
 from cortex.core.profile_normalizer import merge_profiles
@@ -95,7 +96,7 @@ app = FastAPI(
 #
 # Starlette middleware ordering: the LAST add_middleware call wraps outermost
 # (processes requests first).  Stack from outermost → innermost:
-#   JWTAuthMiddleware → BlockDocsInProduction → TrustedHostMiddleware → OriginRefererMiddleware → CORSMiddleware
+#   JWTAuthMiddleware → RequestNonceMiddleware → BlockDocsInProduction → TrustedHostMiddleware → OriginRefererMiddleware → CORSMiddleware
 # ---------------------------------------------------------------------------
 
 # CORS — innermost; runs last on requests, first on responses.
@@ -127,6 +128,13 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts)
 
 # Docs blocker — hides /docs, /redoc, /openapi.json from non-dev hosts.
 app.add_middleware(BlockDocsInProduction)
+
+# Signed-nonce anti-replay — runs inside JWT; by the time it executes,
+# request.state.user_id has already been stamped by JWTAuthMiddleware.
+# Validates X-Request-Token on all mutating routes when ENABLE_REQUEST_NONCE=true.
+# Defense-in-depth only: raises the cost of casual Postman/curl abuse.
+# Gated by ENABLE_REQUEST_NONCE env var (opt-in rollout).
+app.add_middleware(RequestNonceMiddleware)
 
 # JWT auth — outermost; runs first on every request.
 # Stamps request.state.user_id from the "sub" claim.
@@ -243,6 +251,21 @@ class LLMPingRequest(BaseModel):
 @app.get("/")
 def root():
     return {"message": "Cortex RAG Engine v2.0 — registry-driven"}
+
+
+@app.get("/auth/session")
+def get_auth_session(request: Request):
+    """Issue a per-session secret for minting request nonces.
+
+    Requires a valid JWT (enforced by JWTAuthMiddleware). Exempt from the nonce
+    check itself — you cannot present a nonce to obtain the first nonce.
+
+    Returns:
+        session_id:     Opaque identifier for this session.
+        session_secret: Secret used by the client to mint X-Request-Token values.
+    """
+    user_id = request.state.user_id
+    return issue_session_token(user_id)
 
 
 @app.post("/llm/ping")
