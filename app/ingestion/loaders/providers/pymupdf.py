@@ -108,5 +108,28 @@ class PyMuPDFLoader(BaseLoader):
                         bbox=tuple(block["bbox"]),
                     ))
 
+        # P2.7: Extract AcroForm fields if option is enabled
+        if self.options.get("extract_form_fields", False):
+            form_elements = self._extract_form_fields(doc)
+            elements.extend(form_elements)
+
         doc.close()
+        return elements
+
+    def _extract_form_fields(self, doc) -> List[Element]:
+        """Extract AcroForm field values from a PDF."""
+        elements: List[Element] = []
+        try:
+            for page in doc:
+                for widget in page.widgets() or []:
+                    label = (widget.field_name or "").strip()
+                    value = str(widget.field_value or "").strip()
+                    if label and value:
+                        elements.append(Element(
+                            type="form_field",
+                            text=f"{label}: {value}",
+                            page=page.number + 1,
+                        ))
+        except Exception:
+            pass  # AcroForm not present or extraction failed
         return elements

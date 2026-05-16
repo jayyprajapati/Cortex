@@ -61,5 +61,7 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 urllib3==2.6.3
 pdfplumber>=0.11.0
+# P2.4: OCR for scanned PDFs — requires system-level 'tesseract' binary (brew install tesseract / apt install tesseract-ocr)
+pytesseract>=0.3.10
 slowapi>=0.1.9
 uvicorn==0.30.6

@@ -125,9 +125,16 @@ def _resolve_components(config: ApplicationConfig) -> ResolvedComponents:
     from app.vectorstore.factory import get_vector_store
     from app.reranker.factory import get_reranker
 
+    loader_options = {
+        **config.loader.provider_options,
+        # P2.4 / P2.7: explicit loader flags merged so providers can read them
+        "ocr_enabled": config.loader.ocr_enabled,
+        "ocr_language": config.loader.ocr_language,
+        "extract_form_fields": config.loader.extract_form_fields,
+    }
     loader = get_loader(
         provider=config.loader.provider,
-        options=config.loader.provider_options,
+        options=loader_options,
     )
 
     chunker = _resolve_chunker(config.chunking)

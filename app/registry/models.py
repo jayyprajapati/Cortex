@@ -11,6 +11,11 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
 class LoaderConfig(BaseModel):
     provider: Literal["docling", "unstructured", "pymupdf", "composite"] = "composite"
     provider_options: Dict[str, Any] = Field(default_factory=dict)
+    # P2.4: OCR for scanned PDFs (disabled by default; requires tesseract binary + pytesseract)
+    ocr_enabled: bool = False
+    ocr_language: str = "eng"
+    # P2.7: AcroForm field extraction (disabled by default)
+    extract_form_fields: bool = False
 
 
 class ChunkingConfig(BaseModel):

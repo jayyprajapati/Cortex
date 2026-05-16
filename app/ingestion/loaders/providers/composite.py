@@ -10,6 +10,7 @@ from app.ingestion.loaders.providers.docx import DocxLoader
 from app.ingestion.loaders.providers.markdown import MarkdownLoader
 from app.ingestion.loaders.providers.pdfplumber_loader import PdfPlumberLoader
 from app.ingestion.loaders.providers.pymupdf import PyMuPDFLoader
+from app.ingestion.loaders.providers.ocr_loader import OCRLoader
 from app.ingestion.loaders.providers.unstructured import UnstructuredLoader
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class CompositeLoader(BaseLoader):
         self._docx_fallback = UnstructuredLoader(options)
         self._html_loader = UnstructuredLoader(options)
         self._md_loader = MarkdownLoader(options)
+        self._ocr_loader = OCRLoader(options)
 
     @classmethod
     def supports_extension(cls, ext: str) -> bool:
@@ -42,6 +44,23 @@ class CompositeLoader(BaseLoader):
                 elements = self._pdf_loader.load(path)
             except Exception:
                 elements = self._pdf_fallback.load(path)
+
+            # P2.4: If OCR is enabled and the document has very little text, route to OCR
+            if self.options.get("ocr_enabled", False):
+                from app.ingestion.loaders.providers.ocr_loader import TEXT_THRESHOLD
+                total_chars = sum(len(e.text) for e in elements)
+                page_count = max(len({e.page for e in elements if e.page}), 1)
+                if total_chars / page_count < TEXT_THRESHOLD:
+                    try:
+                        ocr_elements = self._ocr_loader.load(path)
+                        if ocr_elements:
+                            logger.debug(
+                                "OCR produced %d element(s) for low-text PDF",
+                                len(ocr_elements),
+                            )
+                            elements = ocr_elements
+                    except Exception as exc:
+                        logger.debug("OCR loader failed (continuing): %s", exc)
 
             # If no table elements were produced, supplement with pdfplumber table extraction
             has_tables = any(e.type == "table" for e in elements)
