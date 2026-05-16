@@ -45,6 +45,7 @@ from cortex.middleware.auth import JWTAuthMiddleware
 from cortex.middleware.docs_block import BlockDocsInProduction
 from cortex.middleware.nonce import RequestNonceMiddleware, issue_session_token
 from cortex.middleware.origin import OriginRefererMiddleware, _ALLOWED_ORIGINS as _CORS_ORIGINS
+from cortex.middleware.upload import read_upload_with_size_limit, validate_upload
 from cortex.core.resume_extractor import extract_resume
 from cortex.core.profile_normalizer import merge_profiles
 from cortex.core.resume_optimizer import analyze_match, generate_document
@@ -363,10 +364,10 @@ async def ingest_endpoint(request: Request):
 
     try:
         if has_upload:
-            file_bytes = await uploaded_file.read()
+            file_bytes = await read_upload_with_size_limit(uploaded_file)
             if not file_bytes:
                 raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-            suffix = os.path.splitext(uploaded_file.filename or "")[1]
+            suffix = validate_upload(uploaded_file.filename or "", file_bytes)
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(file_bytes)
                 temp_path = tmp.name
@@ -877,10 +878,10 @@ async def extract_endpoint(request: Request):
     temp_path = None
     try:
         if has_upload:
-            file_bytes = await uploaded_file.read()
+            file_bytes = await read_upload_with_size_limit(uploaded_file)
             if not file_bytes:
                 raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-            suffix = os.path.splitext(uploaded_file.filename or "")[1]
+            suffix = validate_upload(uploaded_file.filename or "", file_bytes)
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(file_bytes)
                 temp_path = tmp.name
