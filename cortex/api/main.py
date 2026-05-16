@@ -83,6 +83,8 @@ from cortex.schemas.resumelab import (
 import asyncio
 import uuid as _uuid_mod
 
+from app.observability.logger import set_request_context
+
 # ---------------------------------------------------------------------------
 # In-process job tracker for async ingestion (P2.8)
 # job_id -> {status, result, error, created_at}
@@ -109,7 +111,7 @@ app = FastAPI(
 #
 # Starlette middleware ordering: the LAST add_middleware call wraps outermost
 # (processes requests first).  Stack from outermost → innermost:
-#   JWTAuthMiddleware → RequestNonceMiddleware → BlockDocsInProduction → TrustedHostMiddleware → OriginRefererMiddleware → CORSMiddleware
+#   RequestContextMiddleware → JWTAuthMiddleware → RequestNonceMiddleware → BlockDocsInProduction → TrustedHostMiddleware → OriginRefererMiddleware → CORSMiddleware
 # ---------------------------------------------------------------------------
 
 # CORS — innermost; runs last on requests, first on responses.
@@ -149,12 +151,33 @@ app.add_middleware(BlockDocsInProduction)
 # Gated by ENABLE_REQUEST_NONCE env var (opt-in rollout).
 app.add_middleware(RequestNonceMiddleware)
 
-# JWT auth — outermost; runs first on every request.
-# Stamps request.state.user_id from the "sub" claim.
+# JWT auth — runs second from outermost (after RequestContextMiddleware sets
+# request_id). Stamps request.state.user_id from the "sub" claim, then calls
+# set_request_context again to add user_id to the ContextVar.
 # Exempt paths: /, /health, /ready, /llm/ping, /docs*, /redoc*, /openapi*.
 # Dev mode (APP_ENV=development): if JWT_PUBLIC_KEY and JWT_JWKS_URL are both
 # unset, tokens are decoded without signature verification (insecure, dev only).
 app.add_middleware(JWTAuthMiddleware)
+
+# RequestContextMiddleware — outermost; runs first on every request.
+# Generates (or forwards) X-Request-ID, stamps request.state.request_id, sets
+# ContextVar so all log records in this async context carry the request_id.
+# user_id ContextVar is updated later by JWTAuthMiddleware once the token is decoded.
+from starlette.middleware.base import BaseHTTPMiddleware as _BaseHTTPMiddleware
+from starlette.responses import Response as _Response
+
+class RequestContextMiddleware(_BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next) -> _Response:
+        # Honour caller-supplied X-Request-ID; generate one if absent.
+        request_id = request.headers.get("X-Request-ID") or str(_uuid_mod.uuid4())
+        request.state.request_id = request_id
+        # Set request_id in ContextVar immediately (user_id filled in by JWT middleware).
+        set_request_context(request_id, "")
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+app.add_middleware(RequestContextMiddleware)
 
 # ---------------------------------------------------------------------------
 # Rate limiting (slowapi)

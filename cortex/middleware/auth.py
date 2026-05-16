@@ -10,6 +10,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from app.observability.logger import set_request_context
+
 logger = logging.getLogger(__name__)
 
 # Routes that don't require auth
@@ -106,6 +108,10 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
                     media_type="application/json",
                 )
             request.state.user_id = user_id
+            # Update ContextVar so subsequent log records include user_id.
+            # request_id was already set by RequestContextMiddleware (outermost).
+            request_id = getattr(request.state, "request_id", "")
+            set_request_context(request_id, user_id)
         except ValueError as e:
             return Response(
                 content=f'{{"detail": "{str(e)}"}}',
