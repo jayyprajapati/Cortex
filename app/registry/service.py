@@ -38,6 +38,9 @@ def _resolve_llm_config(llm_override: Optional[Dict[str, Any]] = None) -> LLMCon
 
         raise HTTPException(status_code=400, detail=f"Unsupported LLM provider: {provider!r}")
 
+    # TODO(P0.4): guard env key fallback behind APP_ENV=development
+    # In production, callers should always pass BYOK via llm_override so that
+    # server-side env keys are never silently used for user requests.
     env_provider = (LLM_PROVIDER or "ollama_cloud").strip().lower()
     env_model = LLM_MODEL
 

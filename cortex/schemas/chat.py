@@ -11,7 +11,7 @@ class ChatRequest(BaseModel):
     """Body for POST /chat."""
 
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     query: str
     thread_id: Optional[str] = None
     doc_ids: Optional[List[str]] = None

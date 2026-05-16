@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.applications import router as applications_router
@@ -41,6 +41,7 @@ from app.threads import (
 from app.threads.summarize import KEEP_RECENT, SUMMARIZE_AFTER, summarize_old_turns
 from app.vectorstore.qdrant_store import delete_document_vectors, delete_user_vectors
 from cortex.middleware.admin_key import require_admin_key
+from cortex.middleware.auth import JWTAuthMiddleware
 from cortex.middleware.docs_block import BlockDocsInProduction
 from cortex.middleware.origin import OriginRefererMiddleware, _ALLOWED_ORIGINS as _CORS_ORIGINS
 from cortex.core.resume_extractor import extract_resume
@@ -94,7 +95,7 @@ app = FastAPI(
 #
 # Starlette middleware ordering: the LAST add_middleware call wraps outermost
 # (processes requests first).  Stack from outermost → innermost:
-#   BlockDocsInProduction → TrustedHostMiddleware → OriginRefererMiddleware → CORSMiddleware
+#   JWTAuthMiddleware → BlockDocsInProduction → TrustedHostMiddleware → OriginRefererMiddleware → CORSMiddleware
 # ---------------------------------------------------------------------------
 
 # CORS — innermost; runs last on requests, first on responses.
@@ -124,8 +125,15 @@ _allowed_hosts: list[str] = (
 )
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts)
 
-# Docs blocker — outermost; hides /docs, /redoc, /openapi.json from non-dev hosts.
+# Docs blocker — hides /docs, /redoc, /openapi.json from non-dev hosts.
 app.add_middleware(BlockDocsInProduction)
+
+# JWT auth — outermost; runs first on every request.
+# Stamps request.state.user_id from the "sub" claim.
+# Exempt paths: /, /health, /ready, /llm/ping, /docs*, /redoc*, /openapi*.
+# Dev mode (APP_ENV=development): if JWT_PUBLIC_KEY and JWT_JWKS_URL are both
+# unset, tokens are decoded without signature verification (insecure, dev only).
+app.add_middleware(JWTAuthMiddleware)
 
 
 _LLM_ERROR_MARKERS = (
@@ -181,7 +189,7 @@ class LLMOptions(BaseModel):
 
 class IngestRequest(BaseModel):
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     doc_id: Optional[str] = None
     file_path: Optional[str] = None
     text: Optional[str] = None
@@ -189,7 +197,7 @@ class IngestRequest(BaseModel):
 
 class GenerateRequest(BaseModel):
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     query: Optional[str] = None
     task: Optional[str] = None
     context: Optional[str] = None
@@ -200,18 +208,18 @@ class GenerateRequest(BaseModel):
 
 class DeleteRequest(BaseModel):
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     doc_id: str
 
 
 class DeleteAllRequest(BaseModel):
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
 
 
 class ReindexRequest(BaseModel):
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     source_dir: str
     drop_first: bool = True
 
@@ -294,7 +302,6 @@ async def ingest_endpoint(request: Request):
         try:
             payload = IngestRequest(
                 app_name=str(form.get("app_name") or "").strip(),
-                user_id=str(form.get("user_id") or "").strip(),
                 doc_id=(str(form.get("doc_id") or "").strip() or None),
                 file_path=(str(form.get("file_path") or "").strip() or None),
                 text=(str(form.get("text") or "").strip() or None),
@@ -318,10 +325,12 @@ async def ingest_endpoint(request: Request):
             detail="Provide exactly one of: file_path, file (upload), or text.",
         )
 
+    user_id = request.state.user_id
+
     try:
         ctx = build_execution_context(
             app_name=payload.app_name,
-            user_id=payload.user_id,
+            user_id=user_id,
         )
     except HTTPException:
         raise
@@ -365,6 +374,8 @@ async def generate_only_endpoint(request: Request, stream: bool = False):
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
+    user_id = request.state.user_id
+
     try:
         llm_override = None
         if payload.llm:
@@ -384,7 +395,7 @@ async def generate_only_endpoint(request: Request, stream: bool = False):
 
         ctx = build_execution_context(
             app_name=payload.app_name,
-            user_id=payload.user_id,
+            user_id=user_id,
             task=payload.task,
             llm_override=llm_override,
             prompt_override=payload.prompt_override,
@@ -442,11 +453,9 @@ async def chat_endpoint(request: Request, stream: bool = True):
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
-    user_id = (payload.user_id or "").strip()
+    user_id = request.state.user_id
     app_name = (payload.app_name or "").strip().lower()
     query = (payload.query or "").strip()
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id is required")
     if not app_name:
         raise HTTPException(status_code=400, detail="app_name is required")
     if not query:
@@ -657,11 +666,11 @@ async def chat_endpoint(request: Request, stream: bool = True):
 
 
 @app.get("/threads", response_model=ThreadListResponse)
-def list_threads_endpoint(user_id: str, app_name: str, limit: int = 50):
-    user_id = (user_id or "").strip()
+def list_threads_endpoint(request: Request, app_name: str, limit: int = 50):
+    user_id = request.state.user_id
     app_name = (app_name or "").strip().lower()
-    if not user_id or not app_name:
-        raise HTTPException(status_code=400, detail="user_id and app_name are required")
+    if not app_name:
+        raise HTTPException(status_code=400, detail="app_name is required")
     if not 1 <= limit <= 200:
         raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
 
@@ -683,10 +692,8 @@ def list_threads_endpoint(user_id: str, app_name: str, limit: int = 50):
 
 
 @app.get("/threads/{thread_id}", response_model=ThreadDetailResponse)
-def get_thread_endpoint(thread_id: str, user_id: str):
-    user_id = (user_id or "").strip()
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id is required")
+def get_thread_endpoint(request: Request, thread_id: str):
+    user_id = request.state.user_id
     thread = get_thread_with_messages(thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
@@ -696,10 +703,8 @@ def get_thread_endpoint(thread_id: str, user_id: str):
 
 
 @app.delete("/threads/{thread_id}")
-def delete_thread_endpoint(thread_id: str, user_id: str):
-    user_id = (user_id or "").strip()
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id is required")
+def delete_thread_endpoint(request: Request, thread_id: str):
+    user_id = request.state.user_id
     thread = get_thread(thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
@@ -710,10 +715,8 @@ def delete_thread_endpoint(thread_id: str, user_id: str):
 
 
 @app.patch("/threads/{thread_id}")
-def patch_thread_endpoint(thread_id: str, user_id: str, payload: ThreadPatchRequest):
-    user_id = (user_id or "").strip()
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id is required")
+def patch_thread_endpoint(request: Request, thread_id: str, payload: ThreadPatchRequest):
+    user_id = request.state.user_id
     thread = get_thread(thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
@@ -725,10 +728,11 @@ def patch_thread_endpoint(thread_id: str, user_id: str, payload: ThreadPatchRequ
 
 
 @app.post("/delete")
-def delete_document_endpoint(payload: DeleteRequest):
+def delete_document_endpoint(request: Request, payload: DeleteRequest):
+    user_id = request.state.user_id
     try:
-        ctx = build_execution_context(app_name=payload.app_name, user_id=payload.user_id)
-        deleted = ctx.components.vector_store.delete_by_doc(ctx.collection, payload.user_id, payload.doc_id)
+        ctx = build_execution_context(app_name=payload.app_name, user_id=user_id)
+        deleted = ctx.components.vector_store.delete_by_doc(ctx.collection, user_id, payload.doc_id)
     except HTTPException:
         raise
     except Exception as exc:
@@ -738,16 +742,17 @@ def delete_document_endpoint(payload: DeleteRequest):
         "status": "ok",
         "deleted_points": deleted,
         "app_name": payload.app_name,
-        "user_id": payload.user_id,
+        "user_id": user_id,
         "doc_id": payload.doc_id,
     }
 
 
 @app.post("/delete_all")
-def delete_all_documents_endpoint(payload: DeleteAllRequest):
+def delete_all_documents_endpoint(request: Request, payload: DeleteAllRequest):
+    user_id = request.state.user_id
     try:
-        ctx = build_execution_context(app_name=payload.app_name, user_id=payload.user_id)
-        deleted = ctx.components.vector_store.delete_by_user(ctx.collection, payload.user_id)
+        ctx = build_execution_context(app_name=payload.app_name, user_id=user_id)
+        deleted = ctx.components.vector_store.delete_by_user(ctx.collection, user_id)
     except HTTPException:
         raise
     except Exception as exc:
@@ -757,7 +762,7 @@ def delete_all_documents_endpoint(payload: DeleteAllRequest):
         "status": "ok",
         "deleted_points": deleted,
         "app_name": payload.app_name,
-        "user_id": payload.user_id,
+        "user_id": user_id,
     }
 
 
@@ -812,7 +817,6 @@ async def extract_endpoint(request: Request):
         try:
             payload = ExtractRequest(
                 app_name=str(form.get("app_name") or "").strip(),
-                user_id=str(form.get("user_id") or "").strip(),
                 doc_id=(str(form.get("doc_id") or "").strip() or None),
                 file_path=(str(form.get("file_path") or "").strip() or None),
                 text=(str(form.get("text") or "").strip() or None),
@@ -839,8 +843,9 @@ async def extract_endpoint(request: Request):
         )
 
     # Validate app exists (fails fast with 404 for unknown app)
+    user_id = request.state.user_id
     try:
-        build_execution_context(app_name=payload.app_name, user_id=payload.user_id)
+        build_execution_context(app_name=payload.app_name, user_id=user_id)
     except HTTPException:
         raise
 
@@ -897,7 +902,7 @@ async def extract_endpoint(request: Request):
 
 
 @app.post("/profile/merge", response_model=ProfileMergeResponse)
-def profile_merge_endpoint(payload: ProfileMergeRequest):
+def profile_merge_endpoint(request: Request, payload: ProfileMergeRequest):
     """
     POST /profile/merge
 
@@ -927,8 +932,9 @@ def profile_merge_endpoint(payload: ProfileMergeRequest):
       - Source doc_id traceability preserved on every canonical item
       - Existing Cortex apps (doclens, cvscan) are unaffected
     """
+    user_id = request.state.user_id
     try:
-        build_execution_context(app_name=payload.app_name, user_id=payload.user_id)
+        build_execution_context(app_name=payload.app_name, user_id=user_id)
     except HTTPException:
         raise
 
@@ -960,7 +966,7 @@ def profile_merge_endpoint(payload: ProfileMergeRequest):
 
 
 @app.post("/analyze/match", response_model=MatchResponse)
-def analyze_match_endpoint(payload: MatchRequest):
+def analyze_match_endpoint(request: Request, payload: MatchRequest):
     """
     POST /analyze/match
 
@@ -993,11 +999,12 @@ def analyze_match_endpoint(payload: MatchRequest):
       role_seniority                  junior|mid|senior|lead|principal|executive
       domain_fit                      One-sentence domain alignment assessment
     """
+    user_id = request.state.user_id
     try:
         llm_ov = _llm_override_from_request(payload.llm)
         ctx = build_execution_context(
             app_name=payload.app_name,
-            user_id=payload.user_id,
+            user_id=user_id,
             task="match",
             llm_override=llm_ov,
         )
@@ -1032,7 +1039,7 @@ def analyze_match_endpoint(payload: MatchRequest):
 
 
 @app.post("/generate/document", response_model=DocumentResponse)
-def generate_document_endpoint(payload: DocumentRequest):
+def generate_document_endpoint(request: Request, payload: DocumentRequest):
     """
     POST /generate/document
 
@@ -1065,12 +1072,13 @@ def generate_document_endpoint(payload: DocumentRequest):
       - removed_content is useful for UI diff display
       - This endpoint does NOT write to Qdrant; call /ingest separately if desired
     """
+    user_id = request.state.user_id
     try:
         llm_ov = _llm_override_from_request(payload.llm)
         task = "modify_existing" if payload.mode == "modify_existing" else "generate"
         ctx = build_execution_context(
             app_name=payload.app_name,
-            user_id=payload.user_id,
+            user_id=user_id,
             task=task,
             llm_override=llm_ov,
         )
@@ -1115,18 +1123,19 @@ def generate_document_endpoint(payload: DocumentRequest):
 
 
 @app.post("/cover-letter", response_model=CoverLetterResponse)
-def cover_letter_endpoint(payload: CoverLetterRequest):
+def cover_letter_endpoint(request: Request, payload: CoverLetterRequest):
     """
     POST /cover-letter
 
     Generate a tailored cover letter from the candidate's canonical profile.
     Grounded — no fabricated claims. Respects user style guidance from settings.
     """
+    user_id = request.state.user_id
     try:
         llm_ov = _llm_override_from_request(payload.llm)
         ctx = build_execution_context(
             app_name=payload.app_name,
-            user_id=payload.user_id,
+            user_id=user_id,
             task="cover_letter",
             llm_override=llm_ov,
         )
@@ -1156,18 +1165,19 @@ def cover_letter_endpoint(payload: CoverLetterRequest):
 
 
 @app.post("/hr-email", response_model=HrEmailResponse)
-def hr_email_endpoint(payload: HrEmailRequest):
+def hr_email_endpoint(request: Request, payload: HrEmailRequest):
     """
     POST /hr-email
 
     Generate a structured recruiter/HR outreach email from the candidate's canonical profile.
     Returns subject + body as JSON. Grounded — no fabricated claims.
     """
+    user_id = request.state.user_id
     try:
         llm_ov = _llm_override_from_request(payload.llm)
         ctx = build_execution_context(
             app_name=payload.app_name,
-            user_id=payload.user_id,
+            user_id=user_id,
             task="hr_email",
             llm_override=llm_ov,
         )
@@ -1198,7 +1208,7 @@ def hr_email_endpoint(payload: HrEmailRequest):
 
 
 @app.post("/compose/rewrite", response_model=RewriteResponse)
-def compose_rewrite_endpoint(payload: RewriteRequest):
+def compose_rewrite_endpoint(request: Request, payload: RewriteRequest):
     """
     POST /compose/rewrite
 
@@ -1206,11 +1216,12 @@ def compose_rewrite_endpoint(payload: RewriteRequest):
     Preserves facts; alters only style, length, and tone.
     Returns rewritten content as HTML.
     """
+    user_id = request.state.user_id
     try:
         llm_ov = _llm_override_from_request(payload.llm)
         ctx = build_execution_context(
             app_name=payload.app_name,
-            user_id=payload.user_id,
+            user_id=user_id,
             task="compose_rewrite",
             llm_override=llm_ov,
         )
@@ -1240,18 +1251,19 @@ def compose_rewrite_endpoint(payload: RewriteRequest):
 
 
 @app.post("/admin/reindex", dependencies=[Depends(require_admin_key)])
-def admin_reindex_endpoint(payload: ReindexRequest):
+def admin_reindex_endpoint(request: Request, payload: ReindexRequest):
     """
     POST /admin/reindex
 
     Drop the app's collection and re-ingest all supported files from source_dir.
     Use drop_first=true (default) for a clean reindex.
     """
+    user_id = request.state.user_id
     try:
         from app.admin.reindex import reindex_app
         result = reindex_app(
             app_name=payload.app_name,
-            user_id=payload.user_id,
+            user_id=user_id,
             source_dir=payload.source_dir,
             drop_first=payload.drop_first,
         )

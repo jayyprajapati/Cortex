@@ -47,7 +47,7 @@ class ExtractMetadata(BaseModel):
 
 class ExtractRequest(BaseModel):
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     doc_id: Optional[str] = None
     file_path: Optional[str] = None
     text: Optional[str] = None
@@ -152,7 +152,7 @@ class CanonicalProfile(BaseModel):
 
 class ProfileMergeRequest(BaseModel):
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     existing_profile: Dict[str, Any]
     incoming_profile: Dict[str, Any]
     similarity_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
@@ -192,7 +192,7 @@ class MatchRequest(BaseModel):
     optionally their current submitted resume.
     """
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     job_description: str
     canonical_profile: Dict[str, Any]
     base_resume: Optional[Dict[str, Any]] = None
@@ -240,7 +240,7 @@ class DocumentRequest(BaseModel):
                              Requires source_resume_content (sectioned_resume_source from /extract).
     """
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     job_description: str
     canonical_profile: Dict[str, Any]
     base_resume: Optional[Dict[str, Any]] = None
@@ -279,7 +279,7 @@ class DocumentResponse(BaseModel):
 
 class CoverLetterRequest(BaseModel):
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     job_description: str
     canonical_profile: Dict[str, Any]
     analysis_summary: Optional[Dict[str, Any]] = None
@@ -295,7 +295,7 @@ class CoverLetterResponse(BaseModel):
 
 class HrEmailRequest(BaseModel):
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     job_description: str
     canonical_profile: Dict[str, Any]
     analysis_summary: Optional[Dict[str, Any]] = None
@@ -313,7 +313,7 @@ class HrEmailResponse(BaseModel):
 
 class RewriteRequest(BaseModel):
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     subject: Optional[str] = None
     body_html: Optional[str] = None
     body_text: Optional[str] = None
