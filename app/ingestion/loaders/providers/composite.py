@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict, List
 
@@ -7,8 +8,11 @@ from app.ingestion.loaders.base import BaseLoader, Element
 from app.ingestion.loaders.providers.docling import DoclingLoader
 from app.ingestion.loaders.providers.docx import DocxLoader
 from app.ingestion.loaders.providers.markdown import MarkdownLoader
+from app.ingestion.loaders.providers.pdfplumber_loader import PdfPlumberLoader
 from app.ingestion.loaders.providers.pymupdf import PyMuPDFLoader
 from app.ingestion.loaders.providers.unstructured import UnstructuredLoader
+
+logger = logging.getLogger(__name__)
 
 _SUPPORTED_EXTENSIONS = frozenset(
     {".pdf", ".docx", ".doc", ".html", ".htm", ".md", ".markdown", ".txt"}
@@ -20,6 +24,7 @@ class CompositeLoader(BaseLoader):
         self.options = options
         self._pdf_loader = DoclingLoader(options)
         self._pdf_fallback = PyMuPDFLoader(options)
+        self._pdf_table_loader = PdfPlumberLoader(options)
         self._docx_loader = DocxLoader(options)
         self._docx_fallback = UnstructuredLoader(options)
         self._html_loader = UnstructuredLoader(options)
@@ -34,9 +39,26 @@ class CompositeLoader(BaseLoader):
 
         if ext == ".pdf":
             try:
-                return self._pdf_loader.load(path)
+                elements = self._pdf_loader.load(path)
             except Exception:
-                return self._pdf_fallback.load(path)
+                elements = self._pdf_fallback.load(path)
+
+            # If no table elements were produced, supplement with pdfplumber table extraction
+            has_tables = any(e.type == "table" for e in elements)
+            if not has_tables:
+                try:
+                    plumber_elements = self._pdf_table_loader.load(path)
+                    table_elements = [e for e in plumber_elements if e.type == "table"]
+                    if table_elements:
+                        logger.debug(
+                            "pdfplumber extracted %d table(s) not found by primary loader",
+                            len(table_elements),
+                        )
+                        elements = elements + table_elements
+                except Exception as exc:
+                    logger.debug("pdfplumber table extraction failed (continuing): %s", exc)
+
+            return elements
 
         if ext in (".docx", ".doc"):
             try:

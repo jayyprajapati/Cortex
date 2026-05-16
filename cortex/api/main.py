@@ -80,6 +80,15 @@ from cortex.schemas.resumelab import (
     RewriteResponse,
 )
 
+import asyncio
+import uuid as _uuid_mod
+
+# ---------------------------------------------------------------------------
+# In-process job tracker for async ingestion (P2.8)
+# job_id -> {status, result, error, created_at}
+# ---------------------------------------------------------------------------
+_ingest_jobs: dict[str, dict] = {}
+
 _env = os.getenv("APP_ENV") or os.getenv("ENV") or os.getenv("PYTHON_ENV") or ""
 _is_dev = str(_env).lower() in ("dev", "development", "local")
 
@@ -358,9 +367,28 @@ def llm_ping_endpoint(payload: LLMPingRequest):
         raise HTTPException(status_code=502, detail=f"LLM provider error: {exc}") from exc
 
 
+@app.get("/ingest/jobs/{job_id}")
+def get_ingest_job(job_id: str, request: Request):
+    """
+    GET /ingest/jobs/{job_id}
+
+    Poll the status of an async ingestion job started with POST /ingest?async=true.
+
+    Returns:
+        status      "pending" | "running" | "done" | "error"
+        result      Ingestion result (present when status == "done")
+        error       Error message (present when status == "error")
+        created_at  ISO timestamp when the job was created
+    """
+    job = _ingest_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
 @app.post("/ingest")
 @limiter.limit("30/minute")
-async def ingest_endpoint(request: Request):
+async def ingest_endpoint(request: Request, background_ingest: bool = False):
     content_type = (request.headers.get("content-type") or "").lower()
     uploaded_file = None
 
@@ -418,22 +446,57 @@ async def ingest_endpoint(request: Request):
         raise
 
     doc_id = resolve_doc_id(payload.doc_id)
+
+    # --- Resolve temp file for uploads (needed whether sync or async) ---
     temp_path = None
+    if has_upload:
+        file_bytes = await read_upload_with_size_limit(uploaded_file)
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        suffix = validate_upload(uploaded_file.filename or "", file_bytes)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(file_bytes)
+            temp_path = tmp.name
 
+    # --- Async path ---
+    if background_ingest:
+        import datetime as _dt
+        job_id = str(_uuid_mod.uuid4())
+        _ingest_jobs[job_id] = {
+            "status": "pending",
+            "result": None,
+            "error": None,
+            "created_at": _dt.datetime.utcnow().isoformat() + "Z",
+        }
+
+        async def _run_ingest_job():
+            _ingest_jobs[job_id]["status"] = "running"
+            _temp = temp_path
+            try:
+                if _temp:
+                    job_result = ingest_document(ctx, _temp, doc_id)
+                elif has_path:
+                    job_result = ingest_document(ctx, payload.file_path, doc_id)
+                else:
+                    job_result = ingest_text(ctx, payload.text, doc_id)
+                _ingest_jobs[job_id]["status"] = "done"
+                _ingest_jobs[job_id]["result"] = job_result
+            except Exception as exc:
+                _ingest_jobs[job_id]["status"] = "error"
+                _ingest_jobs[job_id]["error"] = str(exc)
+            finally:
+                if _temp and os.path.exists(_temp):
+                    os.remove(_temp)
+
+        asyncio.create_task(_run_ingest_job())
+        return {"status": "pending", "job_id": job_id, "doc_id": doc_id}
+
+    # --- Synchronous path (default) ---
     try:
-        if has_upload:
-            file_bytes = await read_upload_with_size_limit(uploaded_file)
-            if not file_bytes:
-                raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-            suffix = validate_upload(uploaded_file.filename or "", file_bytes)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(file_bytes)
-                temp_path = tmp.name
+        if temp_path:
             result = ingest_document(ctx, temp_path, doc_id)
-
         elif has_path:
             result = ingest_document(ctx, payload.file_path, doc_id)
-
         else:
             result = ingest_text(ctx, payload.text, doc_id)
 

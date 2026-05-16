@@ -20,6 +20,7 @@ class ChunkingConfig(BaseModel):
     min_tokens: int = 128
     keep_tables_atomic: bool = True
     keep_code_atomic: bool = True
+    replace_on_doc_id: bool = True
     provider_options: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("max_tokens")

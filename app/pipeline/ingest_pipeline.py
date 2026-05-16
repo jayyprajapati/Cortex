@@ -110,6 +110,13 @@ def _ingest_elements(ctx: ExecutionContext, elements, doc_id: str) -> dict:
             logger.warning("Sparse embedding failed, proceeding without sparse: %s", exc)
     embed_ms = (time.monotonic() - t_embed) * 1000
 
+    # --- Delete existing chunks for this doc (prevents orphan accumulation on re-ingest) ---
+    if getattr(chunking_cfg, "replace_on_doc_id", True):
+        try:
+            vs.delete_by_doc(collection, user_id, doc_id)
+        except Exception as del_exc:
+            logger.warning("delete_by_doc failed (continuing): %s", del_exc)
+
     # --- Store ---
     t_store = time.monotonic()
     batch_points = []

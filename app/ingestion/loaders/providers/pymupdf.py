@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Any, Dict, List
 
 from app.ingestion.loaders.base import BaseLoader, Element
@@ -19,6 +20,45 @@ class PyMuPDFLoader(BaseLoader):
         except ImportError:
             raise ImportError("PyMuPDF is not installed. Run: pip install PyMuPDF")
         doc = fitz.open(path)
+        total_pages = len(doc)
+        strip_hf = bool(self.options.get("strip_headers_footers", False))
+
+        # ---------------------------------------------------------------------------
+        # P2.5: First pass — collect page dimensions and candidate header/footer text
+        # for documents that opt into stripping.
+        # ---------------------------------------------------------------------------
+        hf_texts: set[str] = set()
+        if strip_hf and total_pages > 0:
+            # text -> set of page indices on which it appears
+            text_pages: dict[str, set[int]] = defaultdict(set)
+            for page_num, page in enumerate(doc):
+                page_h = page.rect.height
+                if page_h <= 0:
+                    continue
+                margin_top = page_h * 0.05
+                margin_bottom = page_h * 0.95
+                blocks = page.get_text("dict")["blocks"]
+                for block in blocks:
+                    if block["type"] != 0:
+                        continue
+                    y0 = block["bbox"][1]
+                    y1 = block["bbox"][3]
+                    # Block is in the top or bottom 5% of the page
+                    if y1 <= margin_top or y0 >= margin_bottom:
+                        for line in block["lines"]:
+                            text = "".join(
+                                span["text"] for span in line["spans"]
+                            ).strip()
+                            if text:
+                                text_pages[text].add(page_num)
+
+            # Any text appearing on ≥80% of pages is a header/footer
+            threshold = max(1, total_pages * 0.80)
+            hf_texts = {t for t, pages in text_pages.items() if len(pages) >= threshold}
+
+        # ---------------------------------------------------------------------------
+        # Second pass — build elements
+        # ---------------------------------------------------------------------------
         elements: List[Element] = []
 
         for page_num, page in enumerate(doc):
@@ -32,6 +72,11 @@ class PyMuPDFLoader(BaseLoader):
                         text = "".join(span["text"] for span in spans)
                         if not text.strip():
                             continue
+
+                        # P2.5: skip header/footer lines
+                        if strip_hf and text.strip() in hf_texts:
+                            continue
+
                         size = spans[0]["size"]
                         flags = spans[0]["flags"]
                         is_bold = bool(flags & 16)
@@ -54,10 +99,13 @@ class PyMuPDFLoader(BaseLoader):
                             bbox=tuple(block["bbox"]),
                         ))
                 elif block["type"] == 1:
+                    # P2.1: fitz type 1 is an image block, not a table.
+                    # Emit as image element with empty text; chunkers skip empty-text elements.
                     elements.append(Element(
-                        type="table",
-                        text="[table]",
+                        type="image",
+                        text="",
                         page=page_num + 1,
+                        bbox=tuple(block["bbox"]),
                     ))
 
         doc.close()
