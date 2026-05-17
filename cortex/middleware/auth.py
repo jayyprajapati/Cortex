@@ -45,7 +45,7 @@ def _verify_token(token: str) -> dict:
     if not public_key and not jwks_url:
         # Dev mode: if neither is configured, decode without verification.
         # This lets the app work without JWT configured (dev only).
-        env = os.getenv("APP_ENV", "").lower()
+        env = (os.getenv("APP_ENV") or os.getenv("ENV") or os.getenv("PYTHON_ENV") or "").lower()
         if env in ("dev", "development", "local"):
             try:
                 return jwt.decode(token, options={"verify_signature": False})
