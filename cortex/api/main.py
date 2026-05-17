@@ -539,11 +539,11 @@ async def ingest_endpoint(request: Request, background_ingest: bool = False):
             _temp = temp_path
             try:
                 if _temp:
-                    job_result = ingest_document(ctx, _temp, doc_id)
+                    job_result = await asyncio.to_thread(ingest_document, ctx, _temp, doc_id)
                 elif has_path:
-                    job_result = ingest_document(ctx, payload.file_path, doc_id)
+                    job_result = await asyncio.to_thread(ingest_document, ctx, payload.file_path, doc_id)
                 else:
-                    job_result = ingest_text(ctx, payload.text, doc_id)
+                    job_result = await asyncio.to_thread(ingest_text, ctx, payload.text, doc_id)
                 _ingest_jobs[job_id]["status"] = "done"
                 _ingest_jobs[job_id]["result"] = job_result
             except Exception as exc:
@@ -559,11 +559,11 @@ async def ingest_endpoint(request: Request, background_ingest: bool = False):
     # --- Synchronous path (default) ---
     try:
         if temp_path:
-            result = ingest_document(ctx, temp_path, doc_id)
+            result = await asyncio.to_thread(ingest_document, ctx, temp_path, doc_id)
         elif has_path:
-            result = ingest_document(ctx, payload.file_path, doc_id)
+            result = await asyncio.to_thread(ingest_document, ctx, payload.file_path, doc_id)
         else:
-            result = ingest_text(ctx, payload.text, doc_id)
+            result = await asyncio.to_thread(ingest_text, ctx, payload.text, doc_id)
 
     except HTTPException:
         raise
