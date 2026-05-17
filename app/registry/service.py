@@ -99,6 +99,7 @@ def _resolve_effective_generation(
 
     if prompt_override:
         system_prompt = prompt_override.strip()
+        resolved_voice_footer = None
 
     # Request-level voice_footer wins over task-level
     if voice_footer is not None:

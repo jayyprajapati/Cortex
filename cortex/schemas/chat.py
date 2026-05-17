@@ -7,6 +7,11 @@ from pydantic import BaseModel, Field
 from cortex.schemas.resumelab import LLMOverride
 
 
+class IncomingChatMessage(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: str
+
+
 class ChatRequest(BaseModel):
     """Body for POST /chat."""
 
@@ -19,6 +24,7 @@ class ChatRequest(BaseModel):
     llm: Optional[LLMOverride] = None
     prompt_override: Optional[str] = None
     voice_footer: Optional[str] = None
+    messages: Optional[List[IncomingChatMessage]] = None
 
 
 class Citation(BaseModel):

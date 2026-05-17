@@ -12,6 +12,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 logger = logging.getLogger(__name__)
+chat_logger = logging.getLogger("cortex.chat")
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -90,6 +91,57 @@ from app.observability.logger import set_request_context
 # job_id -> {status, result, error, created_at}
 # ---------------------------------------------------------------------------
 _ingest_jobs: dict[str, dict] = {}
+
+
+def _preview(value: Any, limit: int = 500) -> str:
+    text = str(value or "").replace("\n", "\\n").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+
+def _message_debug(messages: Optional[List[Any]], limit: int = 12) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for msg in list(messages or [])[-limit:]:
+        role = getattr(msg, "role", None)
+        content = getattr(msg, "content", None)
+        if isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content")
+        result.append({
+            "role": role,
+            "chars": len(str(content or "")),
+            "preview": _preview(content, 220),
+        })
+    return result
+
+
+def _sanitize_request_history(
+    messages: Optional[List[Any]],
+    *,
+    current_query: str,
+    max_messages: int,
+) -> list[dict[str, str]]:
+    clean: list[dict[str, str]] = []
+    for msg in messages or []:
+        role = getattr(msg, "role", None)
+        content = getattr(msg, "content", None)
+        if isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content")
+        if role not in {"user", "assistant"}:
+            continue
+        text = str(content or "").strip()
+        if not text:
+            continue
+        clean.append({"role": str(role), "content": text[:2000]})
+
+    # The request body usually includes the current user message. It belongs in
+    # QUESTION, not RECENT TURNS, otherwise the model sees it twice.
+    if clean and clean[-1]["role"] == "user" and clean[-1]["content"].strip() == current_query.strip():
+        clean.pop()
+
+    return clean[-max_messages:]
 
 _env = os.getenv("APP_ENV") or os.getenv("ENV") or os.getenv("PYTHON_ENV") or ""
 _is_dev = str(_env).lower() in ("dev", "development", "local")
@@ -671,6 +723,20 @@ async def chat_endpoint(request: Request, stream: bool = True):
     user_id = request.state.user_id
     app_name = (payload.app_name or "").strip().lower()
     query = (payload.query or "").strip()
+    chat_logger.info(
+        "chat.request.received app=%s user_id=%s stream=%s thread_id=%s task=%s query_chars=%d query=%r doc_ids=%s request_messages=%s prompt_override_chars=%d llm_override=%s",
+        app_name,
+        user_id,
+        stream,
+        payload.thread_id,
+        payload.task,
+        len(query),
+        _preview(query, 500),
+        payload.doc_ids or [],
+        _message_debug(payload.messages),
+        len(payload.prompt_override or ""),
+        bool(payload.llm),
+    )
     if not app_name:
         raise HTTPException(status_code=400, detail="app_name is required")
     if not query:
@@ -685,6 +751,14 @@ async def chat_endpoint(request: Request, stream: bool = True):
         thread = get_thread(payload.thread_id)
         if thread is None:
             doc_ids = payload.doc_ids or []
+            chat_logger.info(
+                "chat.thread.create_requested app=%s user_id=%s requested_thread_id=%s doc_ids=%s title=%r",
+                app_name,
+                user_id,
+                payload.thread_id,
+                doc_ids,
+                _auto_title(query),
+            )
             create_thread(
                 app_name=app_name,
                 user_id=user_id,
@@ -693,10 +767,33 @@ async def chat_endpoint(request: Request, stream: bool = True):
                 thread_id=payload.thread_id,
             )
             thread = get_thread(payload.thread_id)
+            chat_logger.info(
+                "chat.thread.created app=%s user_id=%s thread_id=%s doc_ids=%s",
+                app_name,
+                user_id,
+                thread["id"] if thread else payload.thread_id,
+                doc_ids,
+            )
         else:
             if thread["user_id"] != user_id or thread["app_name"] != app_name:
+                chat_logger.warning(
+                    "chat.thread.forbidden requested_thread_id=%s token_user_id=%s thread_user_id=%s token_app=%s thread_app=%s",
+                    payload.thread_id,
+                    user_id,
+                    thread["user_id"],
+                    app_name,
+                    thread["app_name"],
+                )
                 raise HTTPException(status_code=403, detail="Thread does not belong to this user")
             doc_ids = thread["doc_ids"] or payload.doc_ids
+            chat_logger.info(
+                "chat.thread.loaded app=%s user_id=%s thread_id=%s doc_ids=%s summary=%s",
+                app_name,
+                user_id,
+                thread["id"],
+                doc_ids,
+                bool(thread.get("summary")),
+            )
     else:
         doc_ids = payload.doc_ids or []
         thread_id_new = create_thread(
@@ -706,6 +803,14 @@ async def chat_endpoint(request: Request, stream: bool = True):
             title=_auto_title(query),
         )
         thread = get_thread(thread_id_new)
+        chat_logger.info(
+            "chat.thread.created app=%s user_id=%s thread_id=%s doc_ids=%s title=%r",
+            app_name,
+            user_id,
+            thread_id_new,
+            doc_ids,
+            _auto_title(query),
+        )
 
     # Check clarification state
     from app.conversation.state import get_clarification_pending, get_clarification_context, clear_clarification_pending
@@ -716,10 +821,43 @@ async def chat_endpoint(request: Request, stream: bool = True):
 
     history = get_recent_messages(thread["id"], n=KEEP_RECENT)
     summary = thread.get("summary")
-    chat_history = [{"role": m["role"], "content": m["content"]} for m in history]
+    stored_chat_history = [{"role": m["role"], "content": m["content"]} for m in history]
+    request_chat_history = _sanitize_request_history(
+        payload.messages,
+        current_query=query,
+        max_messages=KEEP_RECENT,
+    )
+    if request_chat_history and len(request_chat_history) > len(stored_chat_history):
+        chat_history = request_chat_history
+        history_source = "request_messages"
+    else:
+        chat_history = stored_chat_history
+        history_source = "thread_store"
+    chat_logger.info(
+        "chat.history.resolved app=%s user_id=%s thread_id=%s stored_count=%d request_count=%d used_count=%d source=%s summary=%s used_messages=%s",
+        app_name,
+        user_id,
+        thread["id"],
+        len(stored_chat_history),
+        len(request_chat_history),
+        len(chat_history),
+        history_source,
+        bool(summary),
+        _message_debug(chat_history),
+    )
     task = (payload.task or "chat").strip().lower()
 
     try:
+        chat_logger.info(
+            "chat.context.build.start app=%s user_id=%s thread_id=%s task=%s doc_ids=%s prompt_override_chars=%d voice_footer_chars=%d",
+            app_name,
+            user_id,
+            thread["id"],
+            task,
+            doc_ids,
+            len(payload.prompt_override or ""),
+            len(payload.voice_footer or ""),
+        )
         ctx = build_execution_context(
             app_name=app_name,
             user_id=user_id,
@@ -728,6 +866,20 @@ async def chat_endpoint(request: Request, stream: bool = True):
             llm_override=llm_override,
             prompt_override=payload.prompt_override,
             voice_footer=payload.voice_footer,
+        )
+        chat_logger.info(
+            "chat.context.build.done app=%s user_id=%s thread_id=%s collection=%s retrieval_top_k=%s rerank_enabled=%s rerank_top_k=%s generation_context_tokens=%s grounding_mode=%s llm_provider=%s llm_model=%s",
+            app_name,
+            user_id,
+            thread["id"],
+            ctx.collection,
+            getattr(ctx.registry.retrieval, "top_k", None),
+            getattr(ctx.registry.reranking, "enabled", None),
+            getattr(ctx.registry.reranking, "top_k", None),
+            getattr(ctx.effective_generation, "max_context_tokens", None),
+            getattr(ctx.effective_generation, "grounding_mode", None),
+            ctx.llm_config.provider,
+            ctx.llm_config.model,
         )
     except HTTPException:
         raise
@@ -746,12 +898,21 @@ async def chat_endpoint(request: Request, stream: bool = True):
             _clarification_marked = False
             try:
                 try:
+                    chat_logger.info(
+                        "chat.stream.start app=%s user_id=%s thread_id=%s query=%r history_count=%d",
+                        app_name,
+                        user_id,
+                        thread["id"],
+                        _preview(query, 500),
+                        len(chat_history),
+                    )
                     async for event_str in stream_answer(
                         ctx=ctx,
                         query=query,
                         chat_history=chat_history,
                         summary=summary,
                         clarification_reply=clarification_reply,
+                        thread_id=thread["id"],
                     ):
                         yield event_str
                         # Parse emitted events to extract answer + citations for thread storage
@@ -764,20 +925,79 @@ async def chat_endpoint(request: Request, stream: bool = True):
                                 elif line.startswith("data: "):
                                     data = _json.loads(line[6:])
                                     if event_type_received == "delta":
-                                        full_answer_parts.append(data.get("text", ""))
+                                        text = data.get("text", "")
+                                        full_answer_parts.append(text)
+                                        chat_logger.info(
+                                            "chat.stream.delta app=%s user_id=%s thread_id=%s chars=%d preview=%r",
+                                            app_name,
+                                            user_id,
+                                            thread["id"],
+                                            len(str(text or "")),
+                                            _preview(text, 500),
+                                        )
                                     elif event_type_received == "clarification":
-                                        full_answer_parts.append(data.get("text", ""))
+                                        text = data.get("text", "")
+                                        full_answer_parts.append(text)
                                         was_clarification = True
+                                        chat_logger.info(
+                                            "chat.stream.clarification app=%s user_id=%s thread_id=%s chars=%d preview=%r",
+                                            app_name,
+                                            user_id,
+                                            thread["id"],
+                                            len(str(text or "")),
+                                            _preview(text, 500),
+                                        )
                                     elif event_type_received == "citations":
                                         citations_list = data.get("citations", [])
+                                        chat_logger.info(
+                                            "chat.stream.citations app=%s user_id=%s thread_id=%s count=%d citations=%s",
+                                            app_name,
+                                            user_id,
+                                            thread["id"],
+                                            len(citations_list or []),
+                                            citations_list,
+                                        )
+                                    elif event_type_received == "meta":
+                                        chat_logger.info(
+                                            "chat.stream.meta app=%s user_id=%s thread_id=%s meta=%s",
+                                            app_name,
+                                            user_id,
+                                            thread["id"],
+                                            data,
+                                        )
+                                    elif event_type_received == "done":
+                                        chat_logger.info(
+                                            "chat.stream.done_event app=%s user_id=%s thread_id=%s data=%s",
+                                            app_name,
+                                            user_id,
+                                            thread["id"],
+                                            data,
+                                        )
                         except Exception:
                             pass
                 except Exception as exc:
+                    chat_logger.exception(
+                        "chat.stream.error app=%s user_id=%s thread_id=%s error=%s",
+                        app_name,
+                        user_id,
+                        thread["id"],
+                        exc,
+                    )
                     yield error_event(str(exc), code="stream_error")
 
                 # Persist thread messages after stream completes
                 try:
                     full_answer = "".join(full_answer_parts)
+                    summary_updated = False
+                    chat_logger.info(
+                        "chat.persist.start app=%s user_id=%s thread_id=%s user_query_chars=%d assistant_chars=%d was_clarification=%s",
+                        app_name,
+                        user_id,
+                        thread["id"],
+                        len(query),
+                        len(full_answer),
+                        was_clarification,
+                    )
                     append_message(thread["id"], "user", query)
                     append_message(
                         thread["id"],
@@ -805,8 +1025,18 @@ async def chat_endpoint(request: Request, stream: bool = True):
                                 new_summary = summarize_old_turns(to_summarize, summary, llm_inst)
                                 if new_summary:
                                     update_summary(thread["id"], new_summary, cutoff)
+                                    summary_updated = True
                             except Exception as summ_exc:
                                 logger.warning("Summarization failed (best-effort): %s", summ_exc)
+                    chat_logger.info(
+                        "chat.persist.done app=%s user_id=%s thread_id=%s total_messages=%d summary_updated=%s answer_preview=%r",
+                        app_name,
+                        user_id,
+                        thread["id"],
+                        count_messages(thread["id"]),
+                        summary_updated,
+                        _preview(full_answer, 500),
+                    )
                 except Exception as exc:
                     logger.warning("Post-stream thread persistence failed: %s", exc)
             finally:
@@ -834,6 +1064,7 @@ async def chat_endpoint(request: Request, stream: bool = True):
                 chat_history=chat_history,
                 summary=summary,
                 clarification_reply=clarification_reply,
+                thread_id=thread["id"],
             )
         except HTTPException:
             raise
