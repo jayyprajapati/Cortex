@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
-from app.context import EffectiveGenerationConfig, ExecutionContext, LLMConfig
+from app.context import EffectiveGenerationConfig, ExecutionContext, LLMConfig, ResolvedComponents
 from app.registry.models import ApplicationConfig, TaskOverride
 from app.registry.store import get_app
 
@@ -27,7 +27,8 @@ def _resolve_llm_config(llm_override: Optional[Dict[str, Any]] = None) -> LLMCon
             return LLMConfig(provider="openai", model=model or "gpt-4o-mini", api_key=resolved_key)
 
         if provider in {"ollama_local", "ollama"}:
-            return LLMConfig(provider="ollama_local", model=model or "llama3")
+            base_url = str(llm_override.get("base_url") or "").strip() or None
+            return LLMConfig(provider="ollama_local", model=model or "llama3", base_url=base_url)
 
         if provider == "ollama_cloud":
             resolved_key = api_key or OLLAMA_CLOUD_API_KEY
@@ -37,6 +38,9 @@ def _resolve_llm_config(llm_override: Optional[Dict[str, Any]] = None) -> LLMCon
 
         raise HTTPException(status_code=400, detail=f"Unsupported LLM provider: {provider!r}")
 
+    # TODO(P0.4): guard env key fallback behind APP_ENV=development
+    # In production, callers should always pass BYOK via llm_override so that
+    # server-side env keys are never silently used for user requests.
     env_provider = (LLM_PROVIDER or "ollama_cloud").strip().lower()
     env_model = LLM_MODEL
 
@@ -61,9 +65,11 @@ def _resolve_effective_generation(
     config: ApplicationConfig,
     task: Optional[str],
     prompt_override: Optional[str],
+    voice_footer: Optional[str] = None,
 ) -> EffectiveGenerationConfig:
     base = config.generation
     system_prompt = config.defaults.system_prompt
+    resolved_voice_footer: Optional[str] = None
 
     resolved_task = task or config.default_task
     task_override: Optional[TaskOverride] = None
@@ -78,15 +84,27 @@ def _resolve_effective_generation(
         temperature = task_override.temperature if task_override.temperature is not None else base.temperature
         strict = task_override.strict if task_override.strict is not None else base.strict
         max_retries = task_override.max_retries if task_override.max_retries is not None else base.max_retries
+        grounding_mode = task_override.grounding_mode if task_override.grounding_mode is not None else base.grounding_mode
+        max_context_tokens = task_override.max_context_tokens if task_override.max_context_tokens is not None else base.max_context_tokens
+        if task_override.voice_footer:
+            resolved_voice_footer = task_override.voice_footer
     else:
         response_type = base.response_type
         schema = base.output_schema
         temperature = base.temperature
         strict = base.strict
         max_retries = base.max_retries
+        grounding_mode = base.grounding_mode
+        max_context_tokens = base.max_context_tokens
 
     if prompt_override:
         system_prompt = prompt_override.strip()
+        resolved_voice_footer = None
+
+    # Request-level voice_footer wins over task-level
+    if voice_footer is not None:
+        stripped = voice_footer.strip()
+        resolved_voice_footer = stripped or None
 
     return EffectiveGenerationConfig(
         system_prompt=system_prompt,
@@ -95,6 +113,70 @@ def _resolve_effective_generation(
         temperature=temperature,
         strict=strict,
         max_retries=max_retries,
+        grounding_mode=grounding_mode,
+        max_context_tokens=max_context_tokens,
+        voice_footer=resolved_voice_footer,
+    )
+
+
+def _resolve_components(config: ApplicationConfig) -> ResolvedComponents:
+    from app.ingestion.loaders.factory import get_loader
+    from app.chunking.chunker import _resolve_chunker
+    from app.embeddings.factory import get_embedder
+    from app.vectorstore.factory import get_vector_store
+    from app.reranker.factory import get_reranker
+
+    loader_options = {
+        **config.loader.provider_options,
+        # P2.4 / P2.7: explicit loader flags merged so providers can read them
+        "ocr_enabled": config.loader.ocr_enabled,
+        "ocr_language": config.loader.ocr_language,
+        "extract_form_fields": config.loader.extract_form_fields,
+    }
+    loader = get_loader(
+        provider=config.loader.provider,
+        options=loader_options,
+    )
+
+    chunker = _resolve_chunker(config.chunking)
+
+    embedder_opts = {
+        "model": config.embedding.model,
+        "batch_size": config.embedding.batch_size,
+        "normalize": config.embedding.normalize,
+        "sparse_model": config.embedding.sparse_model,
+        **(config.embedding.provider_options or {}),
+    }
+    if config.embedding.dimension is not None:
+        embedder_opts["dimension"] = config.embedding.dimension
+    embedder = get_embedder(
+        provider=config.embedding.provider,
+        options=embedder_opts,
+    )
+
+    vector_store = get_vector_store(
+        provider=config.vector_store.provider,
+        options=config.vector_store.provider_options,
+    )
+
+    reranker = None
+    if config.reranking.enabled:
+        reranker_opts = {
+            "model": config.reranking.model,
+            "diversity": config.reranking.diversity,
+            **(config.reranking.provider_options or {}),
+        }
+        reranker = get_reranker(
+            provider=config.reranking.provider,
+            options=reranker_opts,
+        )
+
+    return ResolvedComponents(
+        loader=loader,
+        chunker=chunker,
+        embedder=embedder,
+        reranker=reranker,
+        vector_store=vector_store,
     )
 
 
@@ -105,6 +187,7 @@ def build_execution_context(
     doc_ids: Optional[List[str]] = None,
     llm_override: Optional[Dict[str, Any]] = None,
     prompt_override: Optional[str] = None,
+    voice_footer: Optional[str] = None,
     request_overrides: Optional[Dict[str, Any]] = None,
 ) -> ExecutionContext:
     normalized_app = (app_name or "").strip().lower()
@@ -127,7 +210,8 @@ def build_execution_context(
         )
 
     llm_config = _resolve_llm_config(llm_override)
-    effective_gen = _resolve_effective_generation(config, normalized_task, prompt_override)
+    effective_gen = _resolve_effective_generation(config, normalized_task, prompt_override, voice_footer)
+    components = _resolve_components(config)
 
     clean_doc_ids: Optional[List[str]] = None
     if doc_ids:
@@ -139,6 +223,7 @@ def build_execution_context(
         registry=config,
         llm_config=llm_config,
         effective_generation=effective_gen,
+        components=components,
         doc_ids=clean_doc_ids,
         task=normalized_task,
         prompt_override=prompt_override,

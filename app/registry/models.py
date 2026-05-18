@@ -8,12 +8,25 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
 
 
-class IngestionConfig(BaseModel):
-    strategy: Literal["semantic_doc", "resume_structured", "markdown_aware"] = "semantic_doc"
+class LoaderConfig(BaseModel):
+    provider: Literal["docling", "unstructured", "pymupdf", "composite"] = "composite"
+    provider_options: Dict[str, Any] = Field(default_factory=dict)
+    # P2.4: OCR for scanned PDFs (disabled by default; requires tesseract binary + pytesseract)
+    ocr_enabled: bool = False
+    ocr_language: str = "eng"
+    # P2.7: AcroForm field extraction (disabled by default)
+    extract_form_fields: bool = False
+
+
+class ChunkingConfig(BaseModel):
+    provider: str = "internal"
+    strategy: str = "layout_aware_semantic"
     max_tokens: int = 512
-    min_tokens: int = 50
-    overlap_tokens: int = 64
-    semantic_split: bool = True
+    min_tokens: int = 128
+    keep_tables_atomic: bool = True
+    keep_code_atomic: bool = True
+    replace_on_doc_id: bool = True
+    provider_options: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("max_tokens")
     @classmethod
@@ -29,27 +42,21 @@ class IngestionConfig(BaseModel):
             raise ValueError("min_tokens must be between 10 and 512")
         return v
 
-    @field_validator("overlap_tokens")
-    @classmethod
-    def _overlap_tokens(cls, v: int) -> int:
-        if not 0 <= v <= 256:
-            raise ValueError("overlap_tokens must be between 0 and 256")
-        return v
-
     @model_validator(mode="after")
-    def _check_sizes(self) -> IngestionConfig:
+    def _check_sizes(self) -> "ChunkingConfig":
         if self.min_tokens >= self.max_tokens:
             raise ValueError("min_tokens must be less than max_tokens")
-        if self.overlap_tokens >= self.max_tokens:
-            raise ValueError("overlap_tokens must be less than max_tokens")
         return self
 
 
 class EmbeddingConfig(BaseModel):
-    model: str
+    provider: Literal["fastembed", "sentence_transformers", "openai", "cohere"] = "sentence_transformers"
+    model: str = "BAAI/bge-small-en-v1.5"
+    sparse_model: Optional[str] = "prithivida/Splade_PP_en_v1"
     batch_size: int = 32
     normalize: bool = True
     dimension: Optional[int] = None
+    provider_options: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("model")
     @classmethod
@@ -74,10 +81,25 @@ class EmbeddingConfig(BaseModel):
         return v
 
 
+class VectorStoreConfig(BaseModel):
+    provider: Literal["qdrant", "pinecone", "weaviate", "chroma"] = "qdrant"
+    distance: Literal["cosine", "dot", "euclid"] = "cosine"
+    provider_options: Dict[str, Any] = Field(default_factory=dict)
+
+
 class RetrievalConfig(BaseModel):
     top_k: int = 10
-    hybrid: bool = True
-    alpha: float = 0.7
+    fusion: Literal["rrf", "alpha"] = "rrf"
+    alpha: float = 0.5
+    rrf_k: int = 60
+    query_rewrite: bool = True
+    hyde: bool = False
+    hyde_temperature: float = 0.7
+    expand_neighbors: bool = True
+    neighbor_budget_tokens: int = 400
+    confidence_min_score: float = 0.25
+    confidence_high: float = 0.7
+    score_threshold: float = 0.0
     metadata_filter: Optional[Dict[str, Any]] = None
 
     @field_validator("top_k")
@@ -97,9 +119,12 @@ class RetrievalConfig(BaseModel):
 
 class RerankingConfig(BaseModel):
     enabled: bool = True
+    provider: Literal["fastembed", "sentence_transformers", "cohere", "jina"] = "sentence_transformers"
     model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    top_k: int = 5
-    candidate_cap: int = 20
+    top_k: int = 6
+    candidate_cap: int = 30
+    diversity: float = 0.0
+    provider_options: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("top_k")
     @classmethod
@@ -115,8 +140,15 @@ class RerankingConfig(BaseModel):
             raise ValueError("candidate_cap must be between 1 and 500")
         return v
 
+    @field_validator("diversity")
+    @classmethod
+    def _diversity(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("diversity must be between 0.0 and 1.0")
+        return v
+
     @model_validator(mode="after")
-    def _top_k_lte_cap(self) -> RerankingConfig:
+    def _top_k_lte_cap(self) -> "RerankingConfig":
         if self.enabled and self.top_k > self.candidate_cap:
             raise ValueError("top_k must be <= candidate_cap when reranking is enabled")
         return self
@@ -125,11 +157,14 @@ class RerankingConfig(BaseModel):
 class GenerationConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    response_type: Literal["markdown", "json"] = "markdown"
+    response_type: Literal["markdown", "json", "text"] = "markdown"
     output_schema: Optional[Dict[str, Any]] = Field(default=None, alias="schema")
     temperature: float = 0.1
     strict: bool = False
     max_retries: int = 2
+    grounding_mode: Literal["strict", "truthful", "off"] = "off"
+    grounding_unverified_threshold: float = 0.15
+    max_context_tokens: int = 4000
 
     @field_validator("temperature")
     @classmethod
@@ -145,11 +180,17 @@ class GenerationConfig(BaseModel):
             raise ValueError("max_retries must be between 0 and 5")
         return v
 
-    @model_validator(mode="after")
-    def _strict_needs_schema(self) -> GenerationConfig:
-        # Only enforce at runtime (generate_pipeline) — task overrides may supply the schema.
-        # So no static rejection here; strict is validated contextually.
-        return self
+
+class ConversationConfig(BaseModel):
+    clarification_policy: Literal["aggressive", "balanced", "never"] = "balanced"
+    max_history_turns: int = 10
+    summary_threshold: int = 12
+    use_query_analyzer: bool = True
+    analyzer_model_override: Optional[str] = None
+    analyzer_temperature: float = 0.0
+    keep_recent: int = 10
+    summarize_after: int = 12
+    auto_title_max_words: int = 8
 
 
 class ApplicationDefaults(BaseModel):
@@ -165,16 +206,17 @@ class ApplicationDefaults(BaseModel):
 
 
 class TaskOverride(BaseModel):
-    """Per-task overrides applied on top of app-level generation config."""
-
     model_config = ConfigDict(populate_by_name=True)
 
     system_prompt: Optional[str] = None
-    response_type: Optional[Literal["markdown", "json"]] = None
+    response_type: Optional[Literal["markdown", "json", "text"]] = None
     output_schema: Optional[Dict[str, Any]] = Field(default=None, alias="schema")
     temperature: Optional[float] = None
     strict: Optional[bool] = None
     max_retries: Optional[int] = None
+    grounding_mode: Optional[Literal["strict", "truthful", "off"]] = None
+    max_context_tokens: Optional[int] = None
+    voice_footer: Optional[str] = None
 
     @field_validator("temperature")
     @classmethod
@@ -189,11 +231,14 @@ class ApplicationConfig(BaseModel):
 
     app_name: str
     collection: str
-    ingestion: IngestionConfig
+    loader: LoaderConfig = Field(default_factory=LoaderConfig)
+    chunking: ChunkingConfig = Field(default_factory=ChunkingConfig)
     embedding: EmbeddingConfig
-    retrieval: RetrievalConfig
-    reranking: RerankingConfig
+    vector_store: VectorStoreConfig = Field(default_factory=VectorStoreConfig)
+    retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
+    reranking: RerankingConfig = Field(default_factory=RerankingConfig)
     generation: GenerationConfig
+    conversation: ConversationConfig = Field(default_factory=ConversationConfig)
     defaults: ApplicationDefaults
     tasks: Dict[str, TaskOverride] = Field(default_factory=dict)
     default_task: Optional[str] = None
@@ -221,7 +266,7 @@ class ApplicationConfig(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _default_task_exists(self) -> ApplicationConfig:
+    def _default_task_exists(self) -> "ApplicationConfig":
         if self.default_task is not None and self.default_task not in self.tasks:
             raise ValueError(
                 f"default_task '{self.default_task}' must exist in tasks"
@@ -229,3 +274,7 @@ class ApplicationConfig(BaseModel):
         if self.tasks and self.default_task is None:
             raise ValueError("default_task is required when tasks are defined")
         return self
+
+
+# Backward compat alias — remove in a future cleanup
+IngestionConfig = ChunkingConfig

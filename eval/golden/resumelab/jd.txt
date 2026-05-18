@@ -1,0 +1,25 @@
+Senior Software Engineer – Backend Platform
+
+We are looking for a Senior Software Engineer to join our Backend Platform team. You will design, build, and operate distributed systems that power our core product APIs.
+
+Responsibilities:
+- Design and implement scalable backend services using Python and/or Node.js
+- Architect RESTful and event-driven APIs consumed by web and mobile clients
+- Own the reliability, performance, and observability of your services (SLOs, alerting, on-call)
+- Collaborate with product and frontend teams to deliver new features end-to-end
+- Review code, mentor junior engineers, and contribute to technical standards
+- Drive data-modelling decisions for PostgreSQL and NoSQL data stores
+
+Requirements:
+- 4+ years of professional software engineering experience
+- Strong proficiency in Python or Node.js (both preferred)
+- Experience building and operating production APIs (REST, GraphQL, or gRPC)
+- Solid understanding of distributed systems: caching, queuing, eventual consistency
+- Familiarity with cloud platforms (AWS, GCP, or Azure) and containerization (Docker, Kubernetes)
+- Experience with SQL (PostgreSQL preferred) and at least one NoSQL store (Redis, MongoDB, DynamoDB)
+- Strong communication skills and comfort working in an async-first remote environment
+
+Nice to have:
+- Experience with RAG pipelines, vector databases, or LLM-integrated systems
+- Contributions to open-source projects
+- Familiarity with infrastructure-as-code (Terraform, Pulumi)

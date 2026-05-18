@@ -17,6 +17,13 @@ OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY")
 LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "ollama_cloud")
 LLM_MODEL: str | None = os.getenv("LLM_MODEL")
 
+# Ollama local timeout in seconds — local models processing large prompts can be slow
+_raw_timeout = os.getenv("OLLAMA_TIMEOUT", "600")
+try:
+    OLLAMA_TIMEOUT: int = max(60, int(_raw_timeout))
+except (TypeError, ValueError):
+    OLLAMA_TIMEOUT = 600
+
 
 def _require_env(name: str) -> str:
     value = str(os.getenv(name) or "").strip()

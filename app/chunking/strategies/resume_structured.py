@@ -47,20 +47,34 @@ class ResumeStructuredStrategy(ChunkingStrategy):
         chunk_id = 0
 
         for section_name, page, lines in sections:
-            for sc in self._split_section(lines, section_name):
+            # Ensure section is never None — pre-content always uses "CONTACT"
+            effective_section = section_name or "CONTACT"
+            section_chunks: List[Chunk] = []
+            for sc in self._split_section(lines, effective_section):
                 if sc["tokens"] < self.config.min_tokens:
                     continue
-                chunks.append(
+                section_chunks.append(
                     Chunk(
                         text=sc["text"],
                         doc_id=doc_id,
                         page=page,
                         chunk_id=chunk_id,
-                        section=section_name,
+                        section=effective_section,
                         token_count=sc["tokens"],
                     )
                 )
                 chunk_id += 1
+
+            # Merge small CONTACT/HEADER chunks into the next chunk
+            if (section_chunks and effective_section in ("CONTACT", "HEADER")
+                    and section_chunks[-1].token_count < self.config.min_tokens
+                    and chunks):
+                prev = chunks[-1]
+                prev.text = prev.text + "\n\n" + section_chunks[-1].text
+                prev.token_count = (prev.token_count or 0) + (section_chunks[-1].token_count or 0)
+                section_chunks = section_chunks[:-1]
+
+            chunks.extend(section_chunks)
 
         return chunks
 
@@ -86,7 +100,7 @@ class ResumeStructuredStrategy(ChunkingStrategy):
                 current_lines = []
             else:
                 if current_name is None:
-                    current_name = "HEADER"
+                    current_name = "CONTACT"
                     current_page = page
                 current_lines.append(text)
 

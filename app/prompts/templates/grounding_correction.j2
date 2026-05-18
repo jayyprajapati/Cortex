@@ -1,0 +1,8 @@
+{{ original_prompt }}
+
+CORRECTION: Your previous response was not valid JSON or did not match the required schema.
+Error: {{ error }}
+{% if schema_hint %}
+Expected shape: {{ schema_hint }}
+{% endif %}
+Return ONLY valid JSON that matches the required schema. No prose, no markdown fences, no comments.

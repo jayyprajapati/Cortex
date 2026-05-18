@@ -1,0 +1,110 @@
+# DocLens RAG golden evaluation set.
+#
+# Each case is checked by eval_rag.py:
+#   - expected_answer_contains: ALL substrings must appear (case-insensitive)
+#   - grounded_required: response.grounded must be true
+#   - expected_refusal: answer must be the STRICT_REFUSAL sentinel
+#   - multi_turn: list of query strings; checks on the FINAL turn only
+#
+# To run:
+#   python3 -m scripts.eval_rag --suite doclens
+#
+# Place a real test resume at eval/golden/doclens/resume.pdf before running.
+
+- id: name
+  query: "Whose resume is this?"
+  expected_answer_contains: ["Jay", "Prajapati"]
+  grounded_required: true
+  note: "Basic identity — model must quote name from contact/header chunk."
+
+- id: developer_synonym
+  query: "Who is the developer mentioned in this document?"
+  expected_answer_contains: ["software engineer"]
+  grounded_required: true
+  note: "Synonym bridging — 'developer' must resolve to the actual title."
+
+- id: current_role
+  query: "What is the candidate's current job title?"
+  expected_answer_contains: []
+  grounded_required: true
+  note: "No fixed string — just verifies grounding is maintained."
+
+- id: out_of_scope_salary
+  query: "What is the candidate's salary expectation?"
+  expected_refusal: true
+  note: "Not in document — strict mode must refuse, not hallucinate."
+
+- id: out_of_scope_age
+  query: "How old is the candidate?"
+  expected_refusal: true
+  note: "Personal info not in resume — must refuse."
+
+- id: skills_list
+  query: "What programming languages does this candidate know?"
+  expected_answer_contains: []
+  grounded_required: true
+  note: "Skill extraction — answer must cite a skills or experience chunk."
+
+- id: education
+  query: "What is the candidate's educational background?"
+  expected_answer_contains: []
+  grounded_required: true
+
+- id: work_experience_companies
+  query: "Which companies has the candidate worked at?"
+  expected_answer_contains: []
+  grounded_required: true
+
+- id: work_experience_recent
+  query: "What did the candidate do at their most recent job?"
+  expected_answer_contains: []
+  grounded_required: true
+
+- id: projects
+  query: "Describe a project the candidate has worked on."
+  expected_answer_contains: []
+  grounded_required: true
+
+- id: certifications
+  query: "Does the candidate have any certifications?"
+  expected_answer_contains: []
+  grounded_required: true
+  note: "If no certifications in doc, model should say so — not invent them."
+
+- id: contact_email
+  query: "What is the candidate's email address?"
+  expected_answer_contains: []
+  grounded_required: true
+
+- id: years_experience
+  query: "How many years of experience does the candidate have?"
+  expected_answer_contains: []
+  grounded_required: true
+
+- id: summary_overview
+  query: "Give me a one-paragraph summary of this resume."
+  expected_answer_contains: []
+  grounded_required: true
+
+- id: no_hallucination_name
+  query: "Is Pratap mentioned in this resume?"
+  expected_refusal: false
+  expected_answer_contains: ["no", "not"]
+  grounded_required: true
+  note: "Hallucination regression: 'Pratap' was hallucinated in a prior incident."
+
+- id: multi_turn_followup
+  multi_turn:
+    - "What companies has the candidate worked at?"
+    - "What did they do at the most recent one?"
+  expected_answer_contains: []
+  grounded_required: true
+  note: "Second turn must resolve 'they' / 'the most recent one' from thread context."
+
+- id: multi_turn_pronoun_resolution
+  multi_turn:
+    - "Tell me about the candidate's skills."
+    - "Which of those are most relevant for a backend engineering role?"
+  expected_answer_contains: []
+  grounded_required: true
+  note: "Tests pronoun resolution ('those') and relevance reasoning from context."

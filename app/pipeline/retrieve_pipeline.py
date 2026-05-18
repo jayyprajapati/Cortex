@@ -1,72 +1,47 @@
 from __future__ import annotations
 
 import logging
-import time
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from app.context import ExecutionContext
-from app.observability.logger import cortex_logger
-from app.reranker.reranker import rerank
-from app.retrieval.search import retrieve
 
 logger = logging.getLogger(__name__)
 
 
-def retrieve_and_rerank(ctx: ExecutionContext, query: str) -> dict:
+def retrieve_and_rerank(
+    ctx: ExecutionContext,
+    query: str,
+    history_summary: Optional[str] = None,
+    clarification_reply: bool = False,
+) -> dict:
     """
-    Full retrieval + reranking pipeline.
-
-    Returns:
-        {chunks: List[dict], is_vague: bool, doc_ids: List[str], clarification: str|None}
+    Thin wrapper over app.retrieval.pipeline.run_retrieval().
+    Returns a dict matching the legacy shape expected by generate_pipeline.py:
+    {chunks, retrieved_count, reranked_count, rerank_latency_ms, is_vague, doc_ids,
+     needs_clarification, clarifying_question, rewrites}
     """
-    t0 = time.monotonic()
+    from app.retrieval.pipeline import run_retrieval
 
-    retrieval_result = retrieve(ctx, query)
-    chunks: List[dict] = retrieval_result.get("chunks", [])
-    retrieved_count = len(chunks)  # before reranking
+    last_assistant = None
 
-    # Propagate early-exit conditions without reranking
-    if not chunks or retrieval_result.get("clarification"):
-        return retrieval_result
-
-    reranking_cfg = ctx.registry.reranking
-    rerank_ms = 0.0
-    if reranking_cfg.enabled:
-        t_rerank = time.monotonic()
-        chunks = rerank(query, chunks, reranking_cfg)
-        rerank_ms = (time.monotonic() - t_rerank) * 1000
-
-        cortex_logger.log_rerank(
-            app_name=ctx.app_name,
-            model=reranking_cfg.model,
-            candidates=len(retrieval_result.get("chunks", [])),
-            selected=len(chunks),
-            latency_ms=rerank_ms,
-        )
-
-    total_ms = (time.monotonic() - t0) * 1000
-
-    retrieval_scores = [c.get("score", 0.0) for c in chunks]
-    rerank_scores = [c["rerank_score"] for c in chunks if c.get("rerank_score") is not None]
-
-    cortex_logger.log_retrieve(
-        app_name=ctx.app_name,
-        user_id=ctx.user_id,
-        query_len=len(query),
-        chunk_count=len(chunks),
-        rerank_enabled=reranking_cfg.enabled,
-        avg_score=sum(retrieval_scores) / len(retrieval_scores) if retrieval_scores else None,
-        avg_rerank=sum(rerank_scores) / len(rerank_scores) if rerank_scores else None,
-        rerank_latency_ms=rerank_ms,
-        total_latency_ms=total_ms,
+    result = run_retrieval(
+        ctx=ctx,
+        query=query,
+        history_summary=history_summary,
+        last_assistant_msg=last_assistant,
+        clarification_reply=clarification_reply,
     )
 
     return {
-        "chunks": chunks,
-        "retrieved_count": retrieved_count,
-        "reranked_count": len(chunks),
-        "rerank_latency_ms": round(rerank_ms, 1),
-        "is_vague": retrieval_result.get("is_vague", False),
-        "doc_ids": retrieval_result.get("doc_ids", []),
-        "clarification": retrieval_result.get("clarification"),
+        "chunks": result.chunks,
+        "retrieved_count": result.retrieved_count,
+        "reranked_count": result.reranked_count,
+        "rerank_latency_ms": result.rerank_latency_ms,
+        "is_vague": result.is_vague,
+        "doc_ids": result.doc_ids,
+        "needs_clarification": result.needs_clarification,
+        "clarifying_question": result.clarifying_question,
+        "rewrites": result.rewrites,
+        # Legacy compat: generate_pipeline.py checks for "clarification" key
+        "clarification": result.clarifying_question if result.needs_clarification else None,
     }

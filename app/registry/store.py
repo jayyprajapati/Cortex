@@ -43,6 +43,58 @@ def list_apps() -> List[str]:
     return sorted(_load_raw().keys())
 
 
+def _migrate_legacy_app(name: str, raw_app: dict) -> dict:
+    """One-shot transform of old ingestion → chunking + loader + vector_store + conversation fields."""
+    import logging
+    _log = logging.getLogger(__name__)
+
+    if "ingestion" not in raw_app:
+        return raw_app  # already new shape
+
+    _log.warning("Migrating legacy registry shape for app '%s' (ingestion → chunking)", name)
+    app = dict(raw_app)
+
+    ingestion = app.pop("ingestion")
+    # Remap ingestion fields to chunking
+    app["chunking"] = {
+        "strategy": ingestion.get("strategy", "layout_aware_semantic"),
+        "max_tokens": ingestion.get("max_tokens", 512),
+        "min_tokens": ingestion.get("min_tokens", 128),
+        "keep_tables_atomic": True,
+        "keep_code_atomic": True,
+    }
+
+    # Add defaults for new required sections
+    if "loader" not in app:
+        app["loader"] = {"provider": "composite"}
+    if "vector_store" not in app:
+        app["vector_store"] = {"provider": "qdrant", "distance": "cosine"}
+    if "conversation" not in app:
+        app["conversation"] = {"clarification_policy": "balanced"}
+
+    # Remap embedding: add provider field if missing
+    if "embedding" in app and "provider" not in app["embedding"]:
+        app["embedding"]["provider"] = "sentence_transformers"
+
+    # Remap retrieval: hybrid→fusion field
+    if "retrieval" in app:
+        ret = app["retrieval"]
+        if "hybrid" in ret:
+            ret.pop("hybrid")  # remove old hybrid bool
+        if "fusion" not in ret:
+            ret["fusion"] = "rrf"
+        if "expand_neighbors" not in ret:
+            ret["expand_neighbors"] = True
+        if "query_rewrite" not in ret:
+            ret["query_rewrite"] = True
+
+    # Remap reranking: add provider field if missing
+    if "reranking" in app and "provider" not in app["reranking"]:
+        app["reranking"]["provider"] = "sentence_transformers"
+
+    return app
+
+
 def get_app(app_name: str) -> Optional[ApplicationConfig]:
     name = _normalize_name(app_name)
     if not name:
@@ -51,6 +103,7 @@ def get_app(app_name: str) -> Optional[ApplicationConfig]:
     payload = raw.get(name)
     if payload is None:
         return None
+    payload = _migrate_legacy_app(name, payload)
     return ApplicationConfig.model_validate({"app_name": name, **payload})
 
 

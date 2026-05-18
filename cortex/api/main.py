@@ -1,34 +1,290 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import tempfile
 from typing import Any, List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
+logger = logging.getLogger(__name__)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ValidationError
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field, ValidationError
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.applications import router as applications_router
 from app.api.collections import router as collections_router
-from app.pipeline.generate_pipeline import generate_answer, generate_direct
+from app.llm.factory import get_llm
+from app.pipeline.generate_pipeline import (
+    extract_citations,
+    generate_answer,
+    generate_direct,
+    stream_answer,
+)
 from app.pipeline.ingest_pipeline import ingest_document, ingest_text, resolve_doc_id
-from app.registry.service import build_execution_context
+from app.registry.service import _resolve_llm_config, build_execution_context
+from app.threads import (
+    append_message,
+    count_messages,
+    create_thread,
+    delete_thread,
+    get_recent_messages,
+    get_thread,
+    get_thread_with_messages,
+    list_threads,
+    update_summary,
+    update_title,
+)
+from app.threads.summarize import KEEP_RECENT, SUMMARIZE_AFTER, summarize_old_turns
 from app.vectorstore.qdrant_store import delete_document_vectors, delete_user_vectors
+from cortex.middleware.admin_key import require_admin_key
+from cortex.middleware.auth import JWTAuthMiddleware
+from cortex.middleware.docs_block import BlockDocsInProduction
+from cortex.middleware.nonce import RequestNonceMiddleware, issue_session_token
+from cortex.middleware.origin import OriginRefererMiddleware, _ALLOWED_ORIGINS as _CORS_ORIGINS
+from cortex.middleware.upload import read_upload_with_size_limit, validate_upload
+from cortex.core.resume_extractor import extract_resume
+from cortex.core.profile_normalizer import merge_profiles
+from cortex.core.resume_optimizer import analyze_match, generate_document
+from cortex.core.composition import generate_cover_letter, generate_hr_email, rewrite_email
+from cortex.schemas.chat import (
+    ChatRequest,
+    ChatResponse,
+    ThreadDetailResponse,
+    ThreadListResponse,
+    ThreadPatchRequest,
+    ThreadSummary,
+)
+from cortex.schemas.resumelab import (
+    ExtractRequest,
+    ExtractResponse,
+    ProfileMergeRequest,
+    ProfileMergeResponse,
+    CanonicalProfile,
+    MatchRequest,
+    MatchResponse,
+    DocumentRequest,
+    DocumentResponse,
+    LLMOverride,
+    CoverLetterRequest,
+    CoverLetterResponse,
+    HrEmailRequest,
+    HrEmailResponse,
+    RewriteRequest,
+    RewriteResponse,
+)
+
+import asyncio
+import uuid as _uuid_mod
+
+from app.observability.logger import set_request_context
+
+# ---------------------------------------------------------------------------
+# In-process job tracker for async ingestion (P2.8)
+# job_id -> {status, result, error, created_at}
+# ---------------------------------------------------------------------------
+_ingest_jobs: dict[str, dict] = {}
+
+
+def _sanitize_request_history(
+    messages: Optional[List[Any]],
+    *,
+    current_query: str,
+    max_messages: int,
+) -> list[dict[str, str]]:
+    clean: list[dict[str, str]] = []
+    for msg in messages or []:
+        role = getattr(msg, "role", None)
+        content = getattr(msg, "content", None)
+        if isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content")
+        if role not in {"user", "assistant"}:
+            continue
+        text = str(content or "").strip()
+        if not text:
+            continue
+        clean.append({"role": str(role), "content": text[:2000]})
+
+    # The request body usually includes the current user message. It belongs in
+    # QUESTION, not RECENT TURNS, otherwise the model sees it twice.
+    if clean and clean[-1]["role"] == "user" and clean[-1]["content"].strip() == current_query.strip():
+        clean.pop()
+
+    return clean[-max_messages:]
+
+_env = os.getenv("APP_ENV") or os.getenv("ENV") or os.getenv("PYTHON_ENV") or ""
+_is_dev = str(_env).lower() in ("dev", "development", "local")
 
 app = FastAPI(
     title="Cortex RAG Engine",
     description="Registry-driven multi-application RAG orchestration",
     version="2.0.0",
+    **({"docs_url": None, "redoc_url": None, "openapi_url": None} if not _is_dev else {}),
 )
 
+# ---------------------------------------------------------------------------
+# Sentry error tracking (opt-in via SENTRY_DSN env var)
+# ---------------------------------------------------------------------------
+_sentry_dsn = os.getenv("SENTRY_DSN")
+if _sentry_dsn:
+    import sentry_sdk
+    from sentry_sdk.integrations.fastapi import FastApiIntegration
+    from sentry_sdk.integrations.starlette import StarletteIntegration
+    sentry_sdk.init(
+        dsn=_sentry_dsn,
+        integrations=[StarletteIntegration(), FastApiIntegration()],
+        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+    )
+
+# ---------------------------------------------------------------------------
+# Security middleware stack
+#
+# NOTE ON HEADER-BASED SECURITY SCOPE
+# Header-based checks (CORS, Origin/Referer pinning, TrustedHost) block browsers
+# and casual scripted abuse, not a determined attacker with a proxy.
+# Real security boundary is JWT (P0.4) + admin key (P0.3).
+#
+# Starlette middleware ordering: the LAST add_middleware call wraps outermost
+# (processes requests first).  Stack from outermost → innermost:
+#   RequestContextMiddleware → JWTAuthMiddleware → RequestNonceMiddleware → BlockDocsInProduction → TrustedHostMiddleware → OriginRefererMiddleware → CORSMiddleware
+# ---------------------------------------------------------------------------
+
+# CORS — innermost; runs last on requests, first on responses.
+# Allowlist is config-driven via CORS_ALLOWED_ORIGINS env var (comma-separated).
+# If not set, falls back to the hardcoded defaults in cortex/middleware/origin.py.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
+
+# Origin/Referer pinning — blocks browser requests from disallowed origins.
+# Server-to-server requests with no Origin/Referer header are always allowed.
+# Exempt paths: /health, /ready, OPTIONS (pre-flight).
+app.add_middleware(OriginRefererMiddleware)
+
+# TrustedHost — rejects requests with an unexpected Host header.
+# Configured via ALLOWED_HOSTS env var (comma-separated).
+# Default: localhost variants + *.jayprajapati.dev wildcard.
+_raw_allowed_hosts = (os.getenv("ALLOWED_HOSTS") or "").strip()
+_allowed_hosts: list[str] = (
+    [h.strip() for h in _raw_allowed_hosts.split(",") if h.strip()]
+    if _raw_allowed_hosts
+    else ["localhost", "127.0.0.1", "0.0.0.0", "*.jayprajapati.dev"]
+)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts)
+
+# Docs blocker — hides /docs, /redoc, /openapi.json from non-dev hosts.
+app.add_middleware(BlockDocsInProduction)
+
+# Signed-nonce anti-replay — runs inside JWT; by the time it executes,
+# request.state.user_id has already been stamped by JWTAuthMiddleware.
+# Validates X-Request-Token on all mutating routes when ENABLE_REQUEST_NONCE=true.
+# Defense-in-depth only: raises the cost of casual Postman/curl abuse.
+# Gated by ENABLE_REQUEST_NONCE env var (opt-in rollout).
+app.add_middleware(RequestNonceMiddleware)
+
+# JWT auth — runs second from outermost (after RequestContextMiddleware sets
+# request_id). Stamps request.state.user_id from the "sub" claim, then calls
+# set_request_context again to add user_id to the ContextVar.
+# Exempt paths: /, /health, /ready, /llm/ping, /docs*, /redoc*, /openapi*.
+# Dev mode (APP_ENV=development): if JWT_PUBLIC_KEY and JWT_JWKS_URL are both
+# unset, tokens are decoded without signature verification (insecure, dev only).
+app.add_middleware(JWTAuthMiddleware)
+
+# RequestContextMiddleware — outermost; runs first on every request.
+# Generates (or forwards) X-Request-ID, stamps request.state.request_id, sets
+# ContextVar so all log records in this async context carry the request_id.
+# user_id ContextVar is updated later by JWTAuthMiddleware once the token is decoded.
+from starlette.middleware.base import BaseHTTPMiddleware as _BaseHTTPMiddleware
+from starlette.responses import Response as _Response
+
+class RequestContextMiddleware(_BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next) -> _Response:
+        # Honour caller-supplied X-Request-ID; generate one if absent.
+        request_id = request.headers.get("X-Request-ID") or str(_uuid_mod.uuid4())
+        request.state.request_id = request_id
+        # Set request_id in ContextVar immediately (user_id filled in by JWT middleware).
+        set_request_context(request_id, "")
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+app.add_middleware(RequestContextMiddleware)
+
+# ---------------------------------------------------------------------------
+# Prometheus request timing middleware
+# ---------------------------------------------------------------------------
+import time as _time_mod
+from app.observability.metrics import request_count, request_latency
+
+class PrometheusMiddleware(_BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next) -> _Response:
+        route = request.url.path
+        method = request.method
+        t0 = _time_mod.monotonic()
+        response = await call_next(request)
+        duration = _time_mod.monotonic() - t0
+        status = str(response.status_code)
+        request_count.labels(route=route, method=method, status=status).inc()
+        request_latency.labels(route=route).observe(duration)
+        return response
+
+app.add_middleware(PrometheusMiddleware)
+
+# ---------------------------------------------------------------------------
+# Rate limiting (slowapi)
+#
+# Keyed by JWT sub (request.state.user_id) so limits are per-user, not per-IP.
+# Falls back to IP for unauthenticated paths (health/ready).
+# In-memory storage — sufficient for single-process deployments.
+# ---------------------------------------------------------------------------
+
+
+def _get_user_id_for_rate_limit(request: Request) -> str:
+    """Key rate limits by JWT sub, fall back to IP."""
+    user_id = getattr(request.state, "user_id", None)
+    if user_id:
+        return user_id
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=_get_user_id_for_rate_limit)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+_LLM_ERROR_MARKERS = (
+    "llm provider", "llm extraction failed", "llm generation failed",
+    "extraction failed", "generation failed",
+)
+
+
+def _llm_override_from_request(llm_field) -> Optional[dict]:
+    """Convert an optional LLMOverride schema object into the dict expected by build_execution_context."""
+    if llm_field is None:
+        return None
+    return {
+        "provider": llm_field.provider,
+        "api_key": llm_field.api_key,
+        "model": llm_field.model,
+        "base_url": llm_field.base_url,
+    }
+
+
+def _llm_status(exc: Exception) -> int:
+    """Return 502 when the failure is from the LLM provider, 400 for input errors."""
+    msg = str(exc).lower()
+    return 502 if any(m in msg for m in _LLM_ERROR_MARKERS) else 400
 
 
 def _sanitize(value: Any) -> Any:
@@ -58,19 +314,9 @@ class LLMOptions(BaseModel):
     model: Optional[str] = None
 
 
-class QueryRequest(BaseModel):
-    app_name: str
-    user_id: str
-    query: str
-    task: Optional[str] = None
-    doc_ids: Optional[List[str]] = None
-    llm: Optional[LLMOptions] = None
-    prompt_override: Optional[str] = None
-
-
 class IngestRequest(BaseModel):
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     doc_id: Optional[str] = None
     file_path: Optional[str] = None
     text: Optional[str] = None
@@ -78,7 +324,7 @@ class IngestRequest(BaseModel):
 
 class GenerateRequest(BaseModel):
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     query: Optional[str] = None
     task: Optional[str] = None
     context: Optional[str] = None
@@ -89,34 +335,453 @@ class GenerateRequest(BaseModel):
 
 class DeleteRequest(BaseModel):
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
     doc_id: str
 
 
 class DeleteAllRequest(BaseModel):
     app_name: str
-    user_id: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
+
+
+class ReindexRequest(BaseModel):
+    app_name: str
+    user_id: Optional[str] = Field(None, description="Deprecated: user identity is read from JWT token")
+    source_dir: str
+    drop_first: bool = True
 
 
 # ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
 
-app.include_router(applications_router)
-app.include_router(collections_router)
+app.include_router(applications_router, dependencies=[Depends(require_admin_key)])
+app.include_router(collections_router, dependencies=[Depends(require_admin_key)])
 
 
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
+class LLMPingRequest(BaseModel):
+    llm: LLMOverride
+
+
 @app.get("/")
 def root():
-    return {"message": "Cortex RAG Engine v2.0 — registry-driven"}
+    return HTMLResponse(
+        """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cortex</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f4f0e7;
+      --paper-deep: #e8e1d3;
+      --ink: #191713;
+      --muted: #6e695f;
+      --faint: #cfc6b5;
+      --line: #858074;
+      --good: #526449;
+      --warn: #7d6234;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 42px;
+      background:
+        linear-gradient(90deg, rgba(25, 23, 19, .045) 1px, transparent 1px),
+        linear-gradient(180deg, rgba(25, 23, 19, .035) 1px, transparent 1px),
+        var(--paper);
+      background-size: 44px 44px;
+      color: var(--ink);
+      font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    }
+    main {
+      width: min(1180px, 100%);
+      margin: 0 auto;
+    }
+    .topline {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 24px;
+      font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", monospace;
+      font-size: .78rem;
+      color: var(--muted);
+      border-bottom: 1px solid var(--faint);
+      padding-bottom: 18px;
+    }
+    .status-line {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-align: right;
+    }
+    .status-mark {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: var(--warn);
+    }
+    .status-mark.ready { background: var(--good); }
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(280px, 390px) 1fr;
+      gap: 42px;
+      align-items: center;
+      min-height: calc(100vh - 126px);
+    }
+    h1 {
+      margin: 0;
+      font-size: 5rem;
+      line-height: .86;
+      letter-spacing: 0;
+      font-weight: 500;
+    }
+    .lede {
+      margin: 28px 0 0;
+      color: var(--muted);
+      font-size: 1.05rem;
+      line-height: 1.75;
+    }
+    .details {
+      display: grid;
+      gap: 14px;
+      margin-top: 34px;
+      font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", monospace;
+      font-size: .82rem;
+    }
+    .detail {
+      display: grid;
+      grid-template-columns: 96px 1fr;
+      gap: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--faint);
+    }
+    .detail span:first-child {
+      color: var(--muted);
+    }
+    .map {
+      position: relative;
+      min-height: 620px;
+    }
+    svg {
+      display: block;
+      width: 100%;
+      height: auto;
+      overflow: visible;
+    }
+    .orbit {
+      fill: none;
+      stroke: var(--faint);
+      stroke-width: 1;
+    }
+    .route {
+      fill: none;
+      stroke: var(--line);
+      stroke-width: 1.5;
+      stroke-linecap: round;
+      stroke-dasharray: 2 13;
+      animation: route-flow 1.7s linear infinite;
+    }
+    .route.slow { animation-duration: 2.2s; }
+    .node-ring {
+      fill: var(--paper);
+      stroke: var(--ink);
+      stroke-width: 1.4;
+    }
+    .app-ring {
+      fill: var(--paper);
+      stroke: var(--line);
+      stroke-width: 1.2;
+    }
+    .node-text {
+      font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", monospace;
+      fill: var(--ink);
+      font-size: 18px;
+    }
+    .node-sub {
+      font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", monospace;
+      fill: var(--muted);
+      font-size: 11px;
+    }
+    .icon {
+      fill: none;
+      stroke: var(--ink);
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .packet {
+      fill: var(--ink);
+      opacity: .9;
+    }
+    .app-label {
+      font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", monospace;
+      fill: var(--ink);
+      font-size: 14px;
+    }
+    .app-caption {
+      font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", monospace;
+      fill: var(--muted);
+      font-size: 10px;
+    }
+    @keyframes route-flow {
+      to { stroke-dashoffset: -30; }
+    }
+    @media (max-width: 900px) {
+      body { padding: 26px; }
+      .hero { grid-template-columns: 1fr; gap: 8px; }
+      h1 { font-size: 4rem; }
+      .map { min-height: 0; }
+      .topline { flex-direction: column; }
+      .status-line { text-align: left; }
+    }
+    @media (max-width: 560px) {
+      body { padding: 20px; }
+      h1 { font-size: 3.25rem; }
+      .detail { grid-template-columns: 1fr; gap: 6px; }
+    }
+  </style>
+</head>
+<body>
+  <main aria-label="Cortex service home">
+    <div class="topline" aria-label="Service metadata">
+      <span>Cortex / personal AI backbone / v2.0</span>
+      <span class="status-line">
+        <span class="status-mark" data-status-mark aria-hidden="true"></span>
+        <span data-status-value>Checking readiness</span>
+      </span>
+    </div>
+
+    <section class="hero">
+      <div>
+        <h1>Cortex</h1>
+        <p class="lede">
+          The central brain for my personal AI applications. Cortex owns the
+          retrieval layer, registry rules, model routing, auth scoping, and
+          generation pipeline while each product keeps its own interface.
+        </p>
+        <div class="details" aria-label="Cortex details">
+          <div class="detail">
+            <span>Mode</span>
+            <span>Registry-driven RAG orchestration</span>
+          </div>
+          <div class="detail">
+            <span>Boundary</span>
+            <span>Authorized clients only. Public API docs stay closed in production.</span>
+          </div>
+          <div class="detail">
+            <span>Ready</span>
+            <span data-status-detail>Waiting for /health</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="map" aria-label="Applications powered by Cortex">
+        <svg viewBox="0 0 1000 650" role="img" aria-labelledby="map-title map-desc">
+          <title id="map-title">Cortex application network</title>
+          <desc id="map-desc">Cortex sits in the center and powers Portfolio, ReachFlow, and DocLens through animated dotted connections.</desc>
+
+          <path class="orbit" d="M500 102a220 220 0 1 1 0 440a220 220 0 1 1 0-440" />
+          <path class="orbit" d="M500 42a280 280 0 1 1 0 560a280 280 0 1 1 0-560" />
+
+          <path id="to-portfolio" class="route" d="M500 322 C420 286 330 200 214 138" />
+          <path id="to-reachflow" class="route slow" d="M500 322 C594 236 716 190 842 142" />
+          <path id="to-doclens" class="route" d="M500 322 C604 382 696 486 812 548" />
+
+          <circle class="packet" r="4">
+            <animateMotion dur="3.3s" repeatCount="indefinite" path="M500 322 C420 286 330 200 214 138" />
+          </circle>
+          <circle class="packet" r="4">
+            <animateMotion dur="3.9s" begin=".7s" repeatCount="indefinite" path="M500 322 C594 236 716 190 842 142" />
+          </circle>
+          <circle class="packet" r="4">
+            <animateMotion dur="3.5s" begin="1.1s" repeatCount="indefinite" path="M500 322 C604 382 696 486 812 548" />
+          </circle>
+
+          <g transform="translate(500 322)">
+            <circle class="node-ring" r="86" />
+            <circle class="orbit" r="64" />
+            <path class="icon" d="M-26 -6h52M-18 -24h36M-18 12h36M-8 -42h16M-8 30h16M-38 -18v24M38 -18v24" />
+            <text class="node-text" text-anchor="middle" y="56">Cortex</text>
+            <text class="node-sub" text-anchor="middle" y="73">RAG CORE</text>
+          </g>
+
+          <g transform="translate(214 138)">
+            <circle class="app-ring" r="52" />
+            <path class="icon" d="M-20 -13h40v30h-40zM-8 -13v-10h16v10M-20 -1h40" />
+            <text class="app-label" text-anchor="middle" y="76">Portfolio</text>
+            <text class="app-caption" text-anchor="middle" y="92">identity layer</text>
+          </g>
+
+          <g transform="translate(842 142)">
+            <circle class="app-ring" r="52" />
+            <path class="icon" d="M-24 12l48-24M-24 -12l48 24M-24 -12v24M8 -20l20 20-20 20" />
+            <text class="app-label" text-anchor="middle" y="76">ReachFlow</text>
+            <text class="app-caption" text-anchor="middle" y="92">workflow engine</text>
+          </g>
+
+          <g transform="translate(812 548)">
+            <circle class="app-ring" r="52" />
+            <path class="icon" d="M-17 -26h25l16 16v36h-41zM8 -26v16h16M-3 4a11 11 0 1 0 0 .1M6 13l14 14" />
+            <text class="app-label" text-anchor="middle" y="76">DocLens</text>
+            <text class="app-caption" text-anchor="middle" y="92">document intelligence</text>
+          </g>
+        </svg>
+      </div>
+    </section>
+  </main>
+  <script>
+    const value = document.querySelector("[data-status-value]");
+    const detail = document.querySelector("[data-status-detail]");
+    const mark = document.querySelector("[data-status-mark]");
+
+    async function refreshReadiness() {
+      try {
+        const response = await fetch("/health", { cache: "no-store", headers: { "Accept": "application/json" } });
+        const data = await response.json().catch(() => ({}));
+        if (response.ok) {
+          value.textContent = "Ready";
+          detail.textContent = "Cortex process is online.";
+          mark.classList.add("ready");
+          return;
+        }
+        value.textContent = "Degraded";
+        detail.textContent = data.detail || "Health check returned " + response.status + ".";
+        mark.classList.remove("ready");
+      } catch (error) {
+        value.textContent = "Unreachable";
+        detail.textContent = "Readiness check could not complete.";
+        mark.classList.remove("ready");
+      }
+    }
+
+    refreshReadiness();
+    window.setInterval(refreshReadiness, 30000);
+  </script>
+</body>
+</html>
+        """.strip()
+    )
+
+
+@app.get("/auth/session")
+def get_auth_session(request: Request):
+    """Issue a per-session secret for minting request nonces.
+
+    Requires a valid JWT (enforced by JWTAuthMiddleware). Exempt from the nonce
+    check itself — you cannot present a nonce to obtain the first nonce.
+
+    Returns:
+        session_id:     Opaque identifier for this session.
+        session_secret: Secret used by the client to mint X-Request-Token values.
+    """
+    user_id = request.state.user_id
+    return issue_session_token(user_id)
+
+
+@app.get("/metrics", dependencies=[Depends(require_admin_key)])
+def metrics_endpoint():
+    """Prometheus metrics endpoint (admin-key gated)."""
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    from fastapi.responses import Response as _MetricsResponse
+    return _MetricsResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/health")
+def health():
+    """Liveness probe — always returns 200 if the process is up."""
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    """Readiness check: verifies Qdrant connectivity and LLM provider config."""
+    errors = []
+
+    # Check Qdrant
+    try:
+        from app.config import get_qdrant_client
+        client = get_qdrant_client()
+        client.get_collections()  # lightweight ping
+    except Exception as e:
+        errors.append(f"qdrant: {e}")
+
+    # Check LLM provider config
+    from app.config import LLM_PROVIDER, OPENAI_API_KEY, OLLAMA_CLOUD_API_KEY
+    provider = LLM_PROVIDER or ""
+    if provider == "openai" and not OPENAI_API_KEY:
+        errors.append("openai: OPENAI_API_KEY not set")
+    elif provider == "ollama_cloud" and not OLLAMA_CLOUD_API_KEY:
+        errors.append("ollama_cloud: OLLAMA_CLOUD_API_KEY not set")
+    # ollama_local has no key requirement
+
+    if errors:
+        return JSONResponse(status_code=503, content={"status": "not ready", "errors": errors})
+    return {"status": "ready"}
+
+
+@app.post("/llm/ping")
+def llm_ping_endpoint(payload: LLMPingRequest):
+    """
+    POST /llm/ping
+
+    Makes a minimal one-token LLM call to verify provider connectivity.
+    Used by the Settings test-connection flow — much faster than /analyze/match.
+    Requires an explicit llm override; never falls back to env-configured defaults.
+    """
+    llm_override = {
+        "provider": payload.llm.provider,
+        "api_key": payload.llm.api_key,
+        "model": payload.llm.model,
+        "base_url": payload.llm.base_url,
+    }
+    try:
+        llm_config = _resolve_llm_config(llm_override)
+    except HTTPException:
+        raise
+
+    try:
+        llm_instance = get_llm(llm_config)
+        llm_instance.generate("Reply with exactly: ok", temperature=0.0)
+        return {
+            "ok": True,
+            "provider": llm_config.provider,
+            "model": llm_config.model,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM provider error: {exc}") from exc
+
+
+@app.get("/ingest/jobs/{job_id}")
+def get_ingest_job(job_id: str, request: Request):
+    """
+    GET /ingest/jobs/{job_id}
+
+    Poll the status of an async ingestion job started with POST /ingest?async=true.
+
+    Returns:
+        status      "pending" | "running" | "done" | "error"
+        result      Ingestion result (present when status == "done")
+        error       Error message (present when status == "error")
+        created_at  ISO timestamp when the job was created
+    """
+    job = _ingest_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 @app.post("/ingest")
-async def ingest_endpoint(request: Request):
+@limiter.limit("30/minute")
+async def ingest_endpoint(request: Request, background_ingest: bool = False):
     content_type = (request.headers.get("content-type") or "").lower()
     uploaded_file = None
 
@@ -140,7 +805,6 @@ async def ingest_endpoint(request: Request):
         try:
             payload = IngestRequest(
                 app_name=str(form.get("app_name") or "").strip(),
-                user_id=str(form.get("user_id") or "").strip(),
                 doc_id=(str(form.get("doc_id") or "").strip() or None),
                 file_path=(str(form.get("file_path") or "").strip() or None),
                 text=(str(form.get("text") or "").strip() or None),
@@ -164,33 +828,70 @@ async def ingest_endpoint(request: Request):
             detail="Provide exactly one of: file_path, file (upload), or text.",
         )
 
+    user_id = request.state.user_id
+
     try:
         ctx = build_execution_context(
             app_name=payload.app_name,
-            user_id=payload.user_id,
+            user_id=user_id,
         )
     except HTTPException:
         raise
 
     doc_id = resolve_doc_id(payload.doc_id)
+
+    # --- Resolve temp file for uploads (needed whether sync or async) ---
     temp_path = None
+    if has_upload:
+        file_bytes = await read_upload_with_size_limit(uploaded_file)
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        suffix = validate_upload(uploaded_file.filename or "", file_bytes)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(file_bytes)
+            temp_path = tmp.name
 
+    # --- Async path ---
+    if background_ingest:
+        import datetime as _dt
+        job_id = str(_uuid_mod.uuid4())
+        _ingest_jobs[job_id] = {
+            "status": "pending",
+            "result": None,
+            "error": None,
+            "created_at": _dt.datetime.utcnow().isoformat() + "Z",
+        }
+
+        async def _run_ingest_job():
+            _ingest_jobs[job_id]["status"] = "running"
+            _temp = temp_path
+            try:
+                if _temp:
+                    job_result = await asyncio.to_thread(ingest_document, ctx, _temp, doc_id)
+                elif has_path:
+                    job_result = await asyncio.to_thread(ingest_document, ctx, payload.file_path, doc_id)
+                else:
+                    job_result = await asyncio.to_thread(ingest_text, ctx, payload.text, doc_id)
+                _ingest_jobs[job_id]["status"] = "done"
+                _ingest_jobs[job_id]["result"] = job_result
+            except Exception as exc:
+                _ingest_jobs[job_id]["status"] = "error"
+                _ingest_jobs[job_id]["error"] = str(exc)
+            finally:
+                if _temp and os.path.exists(_temp):
+                    os.remove(_temp)
+
+        asyncio.create_task(_run_ingest_job())
+        return {"status": "pending", "job_id": job_id, "doc_id": doc_id}
+
+    # --- Synchronous path (default) ---
     try:
-        if has_upload:
-            file_bytes = await uploaded_file.read()
-            if not file_bytes:
-                raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-            suffix = os.path.splitext(uploaded_file.filename or "")[1]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(file_bytes)
-                temp_path = tmp.name
-            result = ingest_document(ctx, temp_path, doc_id)
-
+        if temp_path:
+            result = await asyncio.to_thread(ingest_document, ctx, temp_path, doc_id)
         elif has_path:
-            result = ingest_document(ctx, payload.file_path, doc_id)
-
+            result = await asyncio.to_thread(ingest_document, ctx, payload.file_path, doc_id)
         else:
-            result = ingest_text(ctx, payload.text, doc_id)
+            result = await asyncio.to_thread(ingest_text, ctx, payload.text, doc_id)
 
     except HTTPException:
         raise
@@ -203,35 +904,17 @@ async def ingest_endpoint(request: Request):
     return {"status": "success", **result}
 
 
-@app.post("/query")
-def query_endpoint(payload: QueryRequest):
-    try:
-        llm_override = None
-        if payload.llm:
-            llm_override = {
-                "provider": payload.llm.provider,
-                "model": payload.llm.model,
-                "api_key": payload.llm.api_key,
-            }
-
-        ctx = build_execution_context(
-            app_name=payload.app_name,
-            user_id=payload.user_id,
-            task=payload.task,
-            doc_ids=payload.doc_ids,
-            llm_override=llm_override,
-            prompt_override=payload.prompt_override,
-        )
-        return generate_answer(ctx, payload.query)
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
 @app.post("/generate")
-def generate_only_endpoint(payload: GenerateRequest):
+@limiter.limit("30/minute")
+async def generate_only_endpoint(request: Request, stream: bool = False):
+    try:
+        body = await request.json()
+        payload = GenerateRequest(**body)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    user_id = request.state.user_id
+
     try:
         llm_override = None
         if payload.llm:
@@ -251,30 +934,382 @@ def generate_only_endpoint(payload: GenerateRequest):
 
         ctx = build_execution_context(
             app_name=payload.app_name,
-            user_id=payload.user_id,
+            user_id=user_id,
             task=payload.task,
             llm_override=llm_override,
             prompt_override=payload.prompt_override,
         )
-        return generate_direct(ctx, query=payload.query or "", context=composed_context)
-
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    if not stream:
+        # Original non-streaming behavior
+        try:
+            return generate_direct(ctx, query=payload.query or "", context=composed_context)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        # SSE streaming path
+        from app.streaming.sse import make_sse_response, meta_event, delta_event, done_event, error_event
 
-@app.post("/delete")
-def delete_document_endpoint(payload: DeleteRequest):
+        async def _gen():
+            yield meta_event({"type": "generate"})
+            try:
+                result = generate_direct(ctx, query=payload.query or "", context=composed_context)
+                answer = result.get("answer", "")
+                answer_text = answer if isinstance(answer, str) else json.dumps(answer)
+                yield delta_event(answer_text)
+                yield done_event({"grounded": result.get("grounded", False)})
+            except Exception as exc:
+                yield error_event(str(exc))
+
+        return make_sse_response(_gen())
+
+
+_AUTO_TITLE_MAX_WORDS = int(os.getenv("AUTO_TITLE_MAX_WORDS", "8"))
+
+
+def _auto_title(query: str) -> str:
+    words = (query or "").strip().split()
+    title = " ".join(words[:_AUTO_TITLE_MAX_WORDS])
+    if len(words) > _AUTO_TITLE_MAX_WORDS:
+        title += "…"
+    return title or "New chat"
+
+
+@app.post("/chat")
+@limiter.limit("30/minute")
+async def chat_endpoint(request: Request, stream: bool = True):
+    """
+    POST /chat
+
+    Streaming (default): returns SSE event stream.
+    Non-streaming (?stream=false): returns JSON ChatResponse.
+    """
     try:
-        ctx = build_execution_context(app_name=payload.app_name, user_id=payload.user_id)
-        deleted = delete_document_vectors(ctx.collection, payload.user_id, payload.doc_id)
+        body = await request.json()
+        payload = ChatRequest(**body)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    user_id = request.state.user_id
+    app_name = (payload.app_name or "").strip().lower()
+    query = (payload.query or "").strip()
+    if not app_name:
+        raise HTTPException(status_code=400, detail="app_name is required")
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    llm_override = _llm_override_from_request(payload.llm)
+
+    # Resolve or create thread.
+    # If the caller provides a thread_id that does not yet exist, create it with
+    # that ID (client-managed sessions). If it does exist, verify ownership.
+    if payload.thread_id:
+        thread = get_thread(payload.thread_id)
+        if thread is None:
+            doc_ids = payload.doc_ids or []
+            create_thread(
+                app_name=app_name,
+                user_id=user_id,
+                doc_ids=doc_ids,
+                title=_auto_title(query),
+                thread_id=payload.thread_id,
+            )
+            thread = get_thread(payload.thread_id)
+        else:
+            if thread["user_id"] != user_id or thread["app_name"] != app_name:
+                raise HTTPException(status_code=403, detail="Thread does not belong to this user")
+            doc_ids = thread["doc_ids"] or payload.doc_ids
+    else:
+        doc_ids = payload.doc_ids or []
+        thread_id_new = create_thread(
+            app_name=app_name,
+            user_id=user_id,
+            doc_ids=doc_ids,
+            title=_auto_title(query),
+        )
+        thread = get_thread(thread_id_new)
+
+    # Check clarification state
+    from app.conversation.state import get_clarification_pending, get_clarification_context, clear_clarification_pending
+    clarification_reply = False
+    if get_clarification_pending(thread):
+        clarification_reply = True
+        clear_clarification_pending(thread["id"])
+
+    history = get_recent_messages(thread["id"], n=KEEP_RECENT)
+    summary = thread.get("summary")
+    stored_chat_history = [{"role": m["role"], "content": m["content"]} for m in history]
+    request_chat_history = _sanitize_request_history(
+        payload.messages,
+        current_query=query,
+        max_messages=KEEP_RECENT,
+    )
+    if request_chat_history and len(request_chat_history) > len(stored_chat_history):
+        chat_history = request_chat_history
+    else:
+        chat_history = stored_chat_history
+    task = (payload.task or "chat").strip().lower()
+
+    try:
+        ctx = build_execution_context(
+            app_name=app_name,
+            user_id=user_id,
+            task=task,
+            doc_ids=doc_ids,
+            llm_override=llm_override,
+            prompt_override=payload.prompt_override,
+            voice_footer=payload.voice_footer,
+        )
     except HTTPException:
         raise
-    except ValueError as exc:
-        detail = str(exc)
-        status = 404 if "No matching vectors" in detail else 400
-        raise HTTPException(status_code=status, detail=detail) from exc
+
+    if stream:
+        # SSE streaming path
+        from app.streaming.sse import make_sse_response, error_event
+
+        async def _sse_generator():
+            full_answer_parts = []
+            citations_list = []
+            event_type_received = None
+            was_clarification = False
+            # Track whether we successfully marked clarification pending so that the
+            # finally block can clear it on crash or client disconnection.
+            _clarification_marked = False
+            try:
+                try:
+                    async for event_str in stream_answer(
+                        ctx=ctx,
+                        query=query,
+                        chat_history=chat_history,
+                        summary=summary,
+                        clarification_reply=clarification_reply,
+                        thread_id=thread["id"],
+                    ):
+                        yield event_str
+                        # Parse emitted events to extract answer + citations for thread storage
+                        import json as _json
+                        try:
+                            # SSE events are "event: TYPE\ndata: JSON\n\n"
+                            for line in event_str.split("\n"):
+                                if line.startswith("event: "):
+                                    event_type_received = line[7:].strip()
+                                elif line.startswith("data: "):
+                                    data = _json.loads(line[6:])
+                                    if event_type_received == "delta":
+                                        text = data.get("text", "")
+                                        full_answer_parts.append(text)
+                                    elif event_type_received == "clarification":
+                                        text = data.get("text", "")
+                                        full_answer_parts.append(text)
+                                        was_clarification = True
+                                    elif event_type_received == "citations":
+                                        citations_list = data.get("citations", [])
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    yield error_event(str(exc), code="stream_error")
+
+                # Persist thread messages after stream completes
+                try:
+                    full_answer = "".join(full_answer_parts)
+                    append_message(thread["id"], "user", query)
+                    append_message(
+                        thread["id"],
+                        "assistant",
+                        full_answer,
+                        citations=citations_list or None,
+                        grounded=False,
+                    )
+                    if was_clarification:
+                        from app.conversation.state import mark_clarification_pending
+                        from app.conversation.clarification import build_clarification_context
+                        mark_clarification_pending(thread["id"], build_clarification_context({}, query))
+                        _clarification_marked = True
+                    # Rolling summarization (best-effort)
+                    total = count_messages(thread["id"])
+                    summarized_up_to = int(thread.get("summary_up_to_message_idx") or 0)
+                    from app.conversation.history import should_summarize
+                    if should_summarize(total, summarized_up_to):
+                        all_msgs = get_thread_with_messages(thread["id"])["messages"]
+                        cutoff = total - KEEP_RECENT
+                        to_summarize = all_msgs[summarized_up_to:cutoff]
+                        if to_summarize:
+                            try:
+                                llm_inst = get_llm(ctx.llm_config)
+                                new_summary = summarize_old_turns(to_summarize, summary, llm_inst)
+                                if new_summary:
+                                    update_summary(thread["id"], new_summary, cutoff)
+                            except Exception as summ_exc:
+                                logger.warning("Summarization failed (best-effort): %s", summ_exc)
+                except Exception as exc:
+                    logger.warning("Post-stream thread persistence failed: %s", exc)
+            finally:
+                # On abrupt teardown (GeneratorExit from client disconnect or unhandled
+                # exception), clear any stale clarification-pending flag so it does not
+                # persist across future requests for this thread.  Two cases:
+                #   1. _clarification_marked=True  → we set the flag intentionally just
+                #      before teardown; leave it (next request will clear it normally).
+                #   2. _clarification_marked=False → flag was never set in this request,
+                #      but a previous stuck flag may still be live; clear it defensively.
+                if not _clarification_marked:
+                    try:
+                        from app.conversation.state import clear_clarification_pending
+                        clear_clarification_pending(thread["id"])
+                    except Exception:
+                        pass
+
+        return make_sse_response(_sse_generator())
+
+    else:
+        # Non-streaming JSON path (legacy)
+        try:
+            result = generate_answer(
+                ctx, query,
+                chat_history=chat_history,
+                summary=summary,
+                clarification_reply=clarification_reply,
+                thread_id=thread["id"],
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
+
+        answer = result.get("answer", "")
+        grounded = bool(result.get("grounded", False))
+        sources = result.get("sources", []) or []
+        meta = result.get("meta", {}) or {}
+
+        answer_text_for_citations = (
+            answer if isinstance(answer, str)
+            else json.dumps(answer) if isinstance(answer, dict)
+            else str(answer)
+        )
+        citations = extract_citations(answer_text_for_citations, sources)
+
+        stored_assistant_content = (
+            answer if isinstance(answer, str)
+            else json.dumps(answer, ensure_ascii=False)
+        )
+        append_message(thread["id"], "user", query)
+        append_message(
+            thread["id"],
+            "assistant",
+            stored_assistant_content,
+            citations=citations or None,
+            grounded=grounded,
+        )
+        if result.get("needs_clarification"):
+            from app.conversation.state import mark_clarification_pending
+            from app.conversation.clarification import build_clarification_context
+            mark_clarification_pending(thread["id"], build_clarification_context({}, query))
+
+        # Summarization
+        total = count_messages(thread["id"])
+        summarized_up_to = int(thread.get("summary_up_to_message_idx") or 0)
+        new_old_count = max(total - KEEP_RECENT - summarized_up_to, 0)
+        if new_old_count >= SUMMARIZE_AFTER:
+            all_msgs = get_thread_with_messages(thread["id"])["messages"]
+            cutoff = total - KEEP_RECENT
+            to_summarize = all_msgs[summarized_up_to:cutoff]
+            if to_summarize:
+                try:
+                    llm_inst = get_llm(ctx.llm_config)
+                    new_summary = summarize_old_turns(to_summarize, summary, llm_inst)
+                    if new_summary:
+                        update_summary(thread["id"], new_summary, cutoff)
+                except Exception as exc:
+                    logger.warning("Summary update failed: %s", exc)
+
+        meta["history_used"] = len(chat_history)
+        meta["summary_in_use"] = bool(summary)
+
+        return ChatResponse(
+            thread_id=thread["id"],
+            answer=answer,
+            grounded=grounded,
+            citations=citations,
+            sources=sources,
+            meta=meta,
+        )
+
+
+@app.get("/threads", response_model=ThreadListResponse)
+def list_threads_endpoint(request: Request, app_name: str, limit: int = 50):
+    user_id = request.state.user_id
+    app_name = (app_name or "").strip().lower()
+    if not app_name:
+        raise HTTPException(status_code=400, detail="app_name is required")
+    if not 1 <= limit <= 200:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+
+    items = list_threads(user_id=user_id, app_name=app_name, limit=limit)
+    summaries = [
+        ThreadSummary(
+            id=t["id"],
+            app_name=t["app_name"],
+            user_id=t["user_id"],
+            doc_ids=t.get("doc_ids") or [],
+            title=t.get("title"),
+            message_count=t.get("message_count", 0),
+            created_at=t["created_at"],
+            updated_at=t["updated_at"],
+        )
+        for t in items
+    ]
+    return ThreadListResponse(threads=summaries)
+
+
+@app.get("/threads/{thread_id}", response_model=ThreadDetailResponse)
+def get_thread_endpoint(request: Request, thread_id: str):
+    user_id = request.state.user_id
+    thread = get_thread_with_messages(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Thread does not belong to this user")
+    return ThreadDetailResponse(**thread)
+
+
+@app.delete("/threads/{thread_id}")
+def delete_thread_endpoint(request: Request, thread_id: str):
+    user_id = request.state.user_id
+    thread = get_thread(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Thread does not belong to this user")
+    delete_thread(thread_id)
+    return {"status": "ok", "deleted_thread_id": thread_id}
+
+
+@app.patch("/threads/{thread_id}")
+def patch_thread_endpoint(request: Request, thread_id: str, payload: ThreadPatchRequest):
+    user_id = request.state.user_id
+    thread = get_thread(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Thread does not belong to this user")
+    if payload.title is not None:
+        update_title(thread_id, payload.title.strip())
+    return {"status": "ok", "thread_id": thread_id}
+
+
+@app.post("/delete")
+def delete_document_endpoint(request: Request, payload: DeleteRequest):
+    user_id = request.state.user_id
+    try:
+        ctx = build_execution_context(app_name=payload.app_name, user_id=user_id)
+        deleted = ctx.components.vector_store.delete_by_doc(ctx.collection, user_id, payload.doc_id)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -282,22 +1317,19 @@ def delete_document_endpoint(payload: DeleteRequest):
         "status": "ok",
         "deleted_points": deleted,
         "app_name": payload.app_name,
-        "user_id": payload.user_id,
+        "user_id": user_id,
         "doc_id": payload.doc_id,
     }
 
 
 @app.post("/delete_all")
-def delete_all_documents_endpoint(payload: DeleteAllRequest):
+def delete_all_documents_endpoint(request: Request, payload: DeleteAllRequest):
+    user_id = request.state.user_id
     try:
-        ctx = build_execution_context(app_name=payload.app_name, user_id=payload.user_id)
-        deleted = delete_user_vectors(ctx.collection, payload.user_id)
+        ctx = build_execution_context(app_name=payload.app_name, user_id=user_id)
+        deleted = ctx.components.vector_store.delete_by_user(ctx.collection, user_id)
     except HTTPException:
         raise
-    except ValueError as exc:
-        detail = str(exc)
-        status = 404 if "No matching vectors" in detail else 400
-        raise HTTPException(status_code=status, detail=detail) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -305,5 +1337,519 @@ def delete_all_documents_endpoint(payload: DeleteAllRequest):
         "status": "ok",
         "deleted_points": deleted,
         "app_name": payload.app_name,
-        "user_id": payload.user_id,
+        "user_id": user_id,
     }
+
+
+@app.post("/extract", response_model=ExtractResponse)
+@limiter.limit("30/minute")
+async def extract_endpoint(request: Request):
+    """
+    POST /extract
+
+    Structured extraction from a resume, profile document, or raw text.
+    Accepts application/json (with text or file_path) or multipart/form-data
+    (with a file upload).
+
+    Input fields:
+      app_name        str         Required. Must be a registered Cortex app.
+      user_id         str         Required.
+      doc_id          str         Optional. Auto-generated if omitted.
+      file            upload      Multipart only. PDF, DOCX, or text file.
+      file_path       str         JSON only. Server-side path to the document.
+      text            str         Raw document text.
+      extraction_type str         "resume" | "generic_profile" | "structured_doc"
+                                  Default: "resume"
+
+    Exactly one of file, file_path, or text must be provided.
+
+    Output: ExtractResponse (see cortex/schemas/resumelab.py)
+    """
+    content_type = (request.headers.get("content-type") or "").lower()
+    uploaded_file = None
+
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+            payload = ExtractRequest(**body)
+        except (ValidationError, Exception) as exc:
+            raise HTTPException(status_code=422, detail=_sanitize(str(exc))) from exc
+
+    elif "multipart/form-data" in content_type:
+        try:
+            form = await request.form()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Unable to parse multipart form-data.") from exc
+
+        uploaded_file = form.get("file")
+        llm_json_str = str(form.get("llm") or "").strip()
+        llm_from_form: Optional[LLMOverride] = None
+        if llm_json_str:
+            try:
+                llm_from_form = LLMOverride(**json.loads(llm_json_str))
+            except (ValueError, TypeError, ValidationError):
+                pass
+
+        try:
+            payload = ExtractRequest(
+                app_name=str(form.get("app_name") or "").strip(),
+                doc_id=(str(form.get("doc_id") or "").strip() or None),
+                file_path=(str(form.get("file_path") or "").strip() or None),
+                text=(str(form.get("text") or "").strip() or None),
+                extraction_type=(str(form.get("extraction_type") or "resume").strip() or "resume"),
+                llm=llm_from_form,
+            )
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=_sanitize(exc.errors())) from exc
+    else:
+        raise HTTPException(
+            status_code=415,
+            detail="Unsupported Content-Type. Use application/json or multipart/form-data.",
+        )
+
+    has_path = bool(payload.file_path)
+    has_upload = uploaded_file is not None and hasattr(uploaded_file, "read")
+    has_text = bool(payload.text)
+    sources = sum([has_path, has_upload, has_text])
+
+    if sources != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one of: file_path, file (upload), or text.",
+        )
+
+    # Validate app exists (fails fast with 404 for unknown app)
+    user_id = request.state.user_id
+    try:
+        build_execution_context(app_name=payload.app_name, user_id=user_id)
+    except HTTPException:
+        raise
+
+    llm_ov = _llm_override_from_request(payload.llm)
+
+    temp_path = None
+    try:
+        if has_upload:
+            file_bytes = await read_upload_with_size_limit(uploaded_file)
+            if not file_bytes:
+                raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+            suffix = validate_upload(uploaded_file.filename or "", file_bytes)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(file_bytes)
+                temp_path = tmp.name
+            result = extract_resume(
+                file_path=temp_path,
+                doc_id=payload.doc_id,
+                extraction_type=payload.extraction_type,
+                llm_override=llm_ov,
+            )
+        elif has_path:
+            result = extract_resume(
+                file_path=payload.file_path,
+                doc_id=payload.doc_id,
+                extraction_type=payload.extraction_type,
+                llm_override=llm_ov,
+            )
+        else:
+            result = extract_resume(
+                text=payload.text,
+                doc_id=payload.doc_id,
+                extraction_type=payload.extraction_type,
+                llm_override=llm_ov,
+            )
+
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    try:
+        return ExtractResponse(**result)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Extraction produced invalid response shape: {_sanitize(exc.errors())}",
+        ) from exc
+
+
+@app.post("/profile/merge", response_model=ProfileMergeResponse)
+def profile_merge_endpoint(request: Request, payload: ProfileMergeRequest):
+    """
+    POST /profile/merge
+
+    Merge two profile dicts into a deduplicated CanonicalProfile.
+
+    Input:
+      app_name              str     Required. Must be a registered Cortex app.
+      user_id               str     Required.
+      existing_profile      dict    Current profile (ExtractResponse or CanonicalProfile shape).
+      incoming_profile      dict    New profile to merge in.
+      similarity_threshold  float   Optional. Cosine similarity threshold for fuzzy dedup.
+                                    Default: 0.85. Range: 0.0–1.0.
+
+    Output: ProfileMergeResponse
+      canonical_profile     CanonicalProfile  Merged, deduplicated profile.
+      added_items           dict              Items from incoming not present in existing.
+      merged_duplicates     dict              Items that were semantically merged.
+      conflicts             dict              Items with irreconcilable field disagreements.
+      stats                 dict              Before/after counts per section.
+
+    Behavior:
+      - Skill names normalized via alias map (React.js → React, AWS variants → AWS, etc.)
+      - Exact canonical_key dedup first, embedding similarity fallback second
+      - Richer content wins: longer string, higher proficiency rank, union of list fields
+      - Bullet dedup for experience: semantic similarity > 0.92 considered duplicate
+      - Conflicts surfaced for experience date disagreements (non-blocking)
+      - Source doc_id traceability preserved on every canonical item
+      - Existing Cortex apps (doclens, cvscan) are unaffected
+    """
+    user_id = request.state.user_id
+    try:
+        build_execution_context(app_name=payload.app_name, user_id=user_id)
+    except HTTPException:
+        raise
+
+    try:
+        result = merge_profiles(
+            existing_profile=payload.existing_profile,
+            incoming_profile=payload.incoming_profile,
+            threshold=payload.similarity_threshold,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    try:
+        canonical = CanonicalProfile(**result["canonical_profile"])
+        return ProfileMergeResponse(
+            canonical_profile=canonical,
+            added_items=result["added_items"],
+            merged_duplicates=result["merged_duplicates"],
+            conflicts=result["conflicts"],
+            stats=result["stats"],
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Merge produced invalid response shape: {_sanitize(exc.errors())}",
+        ) from exc
+
+
+@app.post("/analyze/match", response_model=MatchResponse)
+@limiter.limit("30/minute")
+def analyze_match_endpoint(request: Request, payload: MatchRequest):
+    """
+    POST /analyze/match
+
+    Compare a job description against a canonical profile and an optional
+    current resume.  Returns a structured gap analysis with the critical
+    A/B distinction:
+
+      missing_keywords               — skills the candidate does NOT have at all
+      existing_but_missing_from_resume — skills in the canonical profile that
+                                         were omitted from the current resume
+                                         (immediate optimization wins)
+
+    Input:
+      app_name           str   Required. Registered Cortex app (e.g. "resumelab").
+      user_id            str   Required.
+      job_description    str   Required. Raw JD text.
+      canonical_profile  dict  Required. Phase 2 CanonicalProfile or ExtractResponse shape.
+      base_resume        dict  Optional. The user's current resume submission.
+
+    Output: MatchResponse
+      match_score                     0-100 ATS fit score
+      required_keywords               All JD keywords extracted
+      missing_keywords                Candidate lacks entirely
+      existing_but_missing_from_resume Candidate has, but didn't include in resume
+      irrelevant_content              Items to remove from resume
+      recommended_additions           Items from profile to add
+      recommended_removals            Items from resume to cut
+      section_rewrites                {summary, skills, projects}
+      ats_keyword_clusters            Keywords grouped by theme
+      role_seniority                  junior|mid|senior|lead|principal|executive
+      domain_fit                      One-sentence domain alignment assessment
+    """
+    user_id = request.state.user_id
+    try:
+        llm_ov = _llm_override_from_request(payload.llm)
+        ctx = build_execution_context(
+            app_name=payload.app_name,
+            user_id=user_id,
+            task="match",
+            llm_override=llm_ov,
+        )
+    except HTTPException:
+        raise
+
+    gen = ctx.effective_generation
+
+    try:
+        result = analyze_match(
+            job_description=payload.job_description,
+            canonical_profile=payload.canonical_profile,
+            base_resume=payload.base_resume,
+            llm_config=ctx.llm_config,
+            system_prompt=gen.system_prompt,
+            schema=gen.schema or {},
+            max_retries=gen.max_retries,
+            temperature=gen.temperature,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    try:
+        return MatchResponse(**result)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Match analysis produced invalid response shape: {_sanitize(exc.errors())}",
+        ) from exc
+
+
+@app.post("/generate/document", response_model=DocumentResponse)
+@limiter.limit("30/minute")
+def generate_document_endpoint(request: Request, payload: DocumentRequest):
+    """
+    POST /generate/document
+
+    Generate structured, ATS-optimized resume content blocks from a canonical
+    profile, targeted at a specific job description and template type.
+
+    TRUTHFUL ONLY — no fabricated skills, experience, metrics, or dates.
+    Every output claim is grounded in the canonical profile provided.
+
+    Input:
+      app_name           str   Required. Registered Cortex app.
+      user_id            str   Required.
+      job_description    str   Required. Raw JD text.
+      canonical_profile  dict  Required. Phase 2 CanonicalProfile dict.
+      base_resume        dict  Optional. Current resume (used for omission detection).
+      template_type      str   "frontend" | "backend" | "fullstack" (default: fullstack)
+
+    Output: DocumentResponse
+      summary              2-3 sentence professional summary with JD keywords
+      skills               Ordered flat list of skill strings, most relevant first
+      projects             Array of relevant project objects
+      experience           Array of experience objects with JD-relevant bullets
+      target_keywords_used JD keywords incorporated into the document
+      removed_content      Items excluded (with brief reason)
+      match_score_improved Estimated ATS score for the generated document (0-100)
+
+    Integration notes (ReachFlow and downstream apps):
+      - Inject summary, skills, experience, projects directly into template slots
+      - target_keywords_used can drive keyword-density validation
+      - removed_content is useful for UI diff display
+      - This endpoint does NOT write to Qdrant; call /ingest separately if desired
+    """
+    user_id = request.state.user_id
+    try:
+        llm_ov = _llm_override_from_request(payload.llm)
+        task = "modify_existing" if payload.mode == "modify_existing" else "generate"
+        ctx = build_execution_context(
+            app_name=payload.app_name,
+            user_id=user_id,
+            task=task,
+            llm_override=llm_ov,
+        )
+    except HTTPException:
+        raise
+
+    gen = ctx.effective_generation
+
+    try:
+        result = generate_document(
+            job_description=payload.job_description,
+            canonical_profile=payload.canonical_profile,
+            base_resume=payload.base_resume,
+            template_type=payload.template_type,
+            llm_config=ctx.llm_config,
+            system_prompt=gen.system_prompt,
+            schema=gen.schema or {},
+            max_retries=gen.max_retries,
+            temperature=gen.temperature,
+            mode=payload.mode,
+            source_resume_content=payload.source_resume_content,
+            original_resume_text=payload.original_resume_text,
+            user_tweak_prompt=payload.user_tweak_prompt,
+            user_system_prompt=payload.user_system_prompt,
+            include_missing_profile_keywords=payload.include_missing_profile_keywords,
+            include_external_keywords=payload.include_external_keywords,
+            remove_irrelevant_keywords=payload.remove_irrelevant_keywords,
+            aggressiveness=payload.aggressiveness,
+            fabrication_check=payload.fabrication_check,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    try:
+        return DocumentResponse(**result)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Document generation produced invalid response shape: {_sanitize(exc.errors())}",
+        ) from exc
+
+
+@app.post("/cover-letter", response_model=CoverLetterResponse)
+def cover_letter_endpoint(request: Request, payload: CoverLetterRequest):
+    """
+    POST /cover-letter
+
+    Generate a tailored cover letter from the candidate's canonical profile.
+    Grounded — no fabricated claims. Respects user style guidance from settings.
+    """
+    user_id = request.state.user_id
+    try:
+        llm_ov = _llm_override_from_request(payload.llm)
+        ctx = build_execution_context(
+            app_name=payload.app_name,
+            user_id=user_id,
+            task="cover_letter",
+            llm_override=llm_ov,
+        )
+    except HTTPException:
+        raise
+
+    gen = ctx.effective_generation
+
+    try:
+        result = generate_cover_letter(
+            job_description=payload.job_description,
+            canonical_profile=payload.canonical_profile,
+            llm_config=ctx.llm_config,
+            system_prompt=gen.system_prompt,
+            analysis_summary=payload.analysis_summary,
+            user_prompt=payload.user_prompt,
+            user_system_prompt=payload.user_system_prompt,
+            max_retries=gen.max_retries,
+            temperature=gen.temperature,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return CoverLetterResponse(**result)
+
+
+@app.post("/hr-email", response_model=HrEmailResponse)
+def hr_email_endpoint(request: Request, payload: HrEmailRequest):
+    """
+    POST /hr-email
+
+    Generate a structured recruiter/HR outreach email from the candidate's canonical profile.
+    Returns subject + body as JSON. Grounded — no fabricated claims.
+    """
+    user_id = request.state.user_id
+    try:
+        llm_ov = _llm_override_from_request(payload.llm)
+        ctx = build_execution_context(
+            app_name=payload.app_name,
+            user_id=user_id,
+            task="hr_email",
+            llm_override=llm_ov,
+        )
+    except HTTPException:
+        raise
+
+    gen = ctx.effective_generation
+
+    try:
+        result = generate_hr_email(
+            job_description=payload.job_description,
+            canonical_profile=payload.canonical_profile,
+            llm_config=ctx.llm_config,
+            system_prompt=gen.system_prompt,
+            analysis_summary=payload.analysis_summary,
+            recipient_name=payload.recipient_name,
+            user_prompt=payload.user_prompt,
+            user_system_prompt=payload.user_system_prompt,
+            max_retries=gen.max_retries,
+            temperature=gen.temperature,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return HrEmailResponse(**result)
+
+
+@app.post("/compose/rewrite", response_model=RewriteResponse)
+def compose_rewrite_endpoint(request: Request, payload: RewriteRequest):
+    """
+    POST /compose/rewrite
+
+    Rewrite an email according to a user instruction (make concise, more formal, etc.).
+    Preserves facts; alters only style, length, and tone.
+    Returns rewritten content as HTML.
+    """
+    user_id = request.state.user_id
+    try:
+        llm_ov = _llm_override_from_request(payload.llm)
+        ctx = build_execution_context(
+            app_name=payload.app_name,
+            user_id=user_id,
+            task="compose_rewrite",
+            llm_override=llm_ov,
+        )
+    except HTTPException:
+        raise
+
+    gen = ctx.effective_generation
+
+    try:
+        result = rewrite_email(
+            instruction=payload.instruction,
+            llm_config=ctx.llm_config,
+            system_prompt=gen.system_prompt,
+            body_html=payload.body_html,
+            body_text=payload.body_text,
+            subject=payload.subject,
+            user_system_prompt=payload.user_system_prompt,
+            max_retries=gen.max_retries,
+            temperature=gen.temperature,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=_llm_status(exc), detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return RewriteResponse(**result)
+
+
+@app.post("/admin/reindex", dependencies=[Depends(require_admin_key)])
+def admin_reindex_endpoint(request: Request, payload: ReindexRequest):
+    """
+    POST /admin/reindex
+
+    Drop the app's collection and re-ingest all supported files from source_dir.
+    Use drop_first=true (default) for a clean reindex.
+    """
+    user_id = request.state.user_id
+    try:
+        from app.admin.reindex import reindex_app
+        result = reindex_app(
+            app_name=payload.app_name,
+            user_id=user_id,
+            source_dir=payload.source_dir,
+            drop_first=payload.drop_first,
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return result

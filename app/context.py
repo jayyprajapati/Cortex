@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 if TYPE_CHECKING:
     from app.registry.models import ApplicationConfig
+    from app.ingestion.loaders.base import BaseLoader
+    from app.chunking.base import BaseChunker
+    from app.embeddings.base import BaseEmbedder
+    from app.vectorstore.base import BaseVectorStore
+    from app.reranker.base import BaseReranker
+
+
+GroundingMode = Literal["strict", "truthful", "off"]
 
 
 @dataclass
@@ -26,6 +34,21 @@ class EffectiveGenerationConfig:
     temperature: float
     strict: bool
     max_retries: int
+    grounding_mode: GroundingMode = "off"
+    max_context_tokens: int = 4000
+    voice_footer: Optional[str] = None
+    citation_validation: bool = False
+    citation_threshold: float = 0.7
+    grounding_unverified_threshold: float = 0.15
+
+
+@dataclass
+class ResolvedComponents:
+    loader: "BaseLoader"
+    chunker: "BaseChunker"
+    embedder: "BaseEmbedder"
+    reranker: Optional["BaseReranker"]
+    vector_store: "BaseVectorStore"
 
 
 @dataclass
@@ -41,6 +64,7 @@ class ExecutionContext:
     registry: "ApplicationConfig"
     llm_config: LLMConfig
     effective_generation: EffectiveGenerationConfig
+    components: Optional[ResolvedComponents] = None   # populated by build_execution_context
     doc_ids: Optional[List[str]] = None
     task: Optional[str] = None
     prompt_override: Optional[str] = None
