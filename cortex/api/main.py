@@ -12,10 +12,9 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 logger = logging.getLogger(__name__)
-chat_logger = logging.getLogger("cortex.chat")
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -91,29 +90,6 @@ from app.observability.logger import set_request_context
 # job_id -> {status, result, error, created_at}
 # ---------------------------------------------------------------------------
 _ingest_jobs: dict[str, dict] = {}
-
-
-def _preview(value: Any, limit: int = 500) -> str:
-    text = str(value or "").replace("\n", "\\n").strip()
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}..."
-
-
-def _message_debug(messages: Optional[List[Any]], limit: int = 12) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for msg in list(messages or [])[-limit:]:
-        role = getattr(msg, "role", None)
-        content = getattr(msg, "content", None)
-        if isinstance(msg, dict):
-            role = msg.get("role")
-            content = msg.get("content")
-        result.append({
-            "role": role,
-            "chars": len(str(content or "")),
-            "preview": _preview(content, 220),
-        })
-    return result
 
 
 def _sanitize_request_history(
@@ -393,7 +369,307 @@ class LLMPingRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"message": "Cortex RAG Engine v2.0 — registry-driven"}
+    return HTMLResponse(
+        """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cortex</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f4f0e7;
+      --paper-deep: #e8e1d3;
+      --ink: #191713;
+      --muted: #6e695f;
+      --faint: #cfc6b5;
+      --line: #858074;
+      --good: #526449;
+      --warn: #7d6234;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 42px;
+      background:
+        linear-gradient(90deg, rgba(25, 23, 19, .045) 1px, transparent 1px),
+        linear-gradient(180deg, rgba(25, 23, 19, .035) 1px, transparent 1px),
+        var(--paper);
+      background-size: 44px 44px;
+      color: var(--ink);
+      font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    }
+    main {
+      width: min(1180px, 100%);
+      margin: 0 auto;
+    }
+    .topline {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 24px;
+      font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", monospace;
+      font-size: .78rem;
+      color: var(--muted);
+      border-bottom: 1px solid var(--faint);
+      padding-bottom: 18px;
+    }
+    .status-line {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-align: right;
+    }
+    .status-mark {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: var(--warn);
+    }
+    .status-mark.ready { background: var(--good); }
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(280px, 390px) 1fr;
+      gap: 42px;
+      align-items: center;
+      min-height: calc(100vh - 126px);
+    }
+    h1 {
+      margin: 0;
+      font-size: 5rem;
+      line-height: .86;
+      letter-spacing: 0;
+      font-weight: 500;
+    }
+    .lede {
+      margin: 28px 0 0;
+      color: var(--muted);
+      font-size: 1.05rem;
+      line-height: 1.75;
+    }
+    .details {
+      display: grid;
+      gap: 14px;
+      margin-top: 34px;
+      font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", monospace;
+      font-size: .82rem;
+    }
+    .detail {
+      display: grid;
+      grid-template-columns: 96px 1fr;
+      gap: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--faint);
+    }
+    .detail span:first-child {
+      color: var(--muted);
+    }
+    .map {
+      position: relative;
+      min-height: 620px;
+    }
+    svg {
+      display: block;
+      width: 100%;
+      height: auto;
+      overflow: visible;
+    }
+    .orbit {
+      fill: none;
+      stroke: var(--faint);
+      stroke-width: 1;
+    }
+    .route {
+      fill: none;
+      stroke: var(--line);
+      stroke-width: 1.5;
+      stroke-linecap: round;
+      stroke-dasharray: 2 13;
+      animation: route-flow 1.7s linear infinite;
+    }
+    .route.slow { animation-duration: 2.2s; }
+    .node-ring {
+      fill: var(--paper);
+      stroke: var(--ink);
+      stroke-width: 1.4;
+    }
+    .app-ring {
+      fill: var(--paper);
+      stroke: var(--line);
+      stroke-width: 1.2;
+    }
+    .node-text {
+      font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", monospace;
+      fill: var(--ink);
+      font-size: 18px;
+    }
+    .node-sub {
+      font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", monospace;
+      fill: var(--muted);
+      font-size: 11px;
+    }
+    .icon {
+      fill: none;
+      stroke: var(--ink);
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .packet {
+      fill: var(--ink);
+      opacity: .9;
+    }
+    .app-label {
+      font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", monospace;
+      fill: var(--ink);
+      font-size: 14px;
+    }
+    .app-caption {
+      font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", monospace;
+      fill: var(--muted);
+      font-size: 10px;
+    }
+    @keyframes route-flow {
+      to { stroke-dashoffset: -30; }
+    }
+    @media (max-width: 900px) {
+      body { padding: 26px; }
+      .hero { grid-template-columns: 1fr; gap: 8px; }
+      h1 { font-size: 4rem; }
+      .map { min-height: 0; }
+      .topline { flex-direction: column; }
+      .status-line { text-align: left; }
+    }
+    @media (max-width: 560px) {
+      body { padding: 20px; }
+      h1 { font-size: 3.25rem; }
+      .detail { grid-template-columns: 1fr; gap: 6px; }
+    }
+  </style>
+</head>
+<body>
+  <main aria-label="Cortex service home">
+    <div class="topline" aria-label="Service metadata">
+      <span>Cortex / personal AI backbone / v2.0</span>
+      <span class="status-line">
+        <span class="status-mark" data-status-mark aria-hidden="true"></span>
+        <span data-status-value>Checking readiness</span>
+      </span>
+    </div>
+
+    <section class="hero">
+      <div>
+        <h1>Cortex</h1>
+        <p class="lede">
+          The central brain for my personal AI applications. Cortex owns the
+          retrieval layer, registry rules, model routing, auth scoping, and
+          generation pipeline while each product keeps its own interface.
+        </p>
+        <div class="details" aria-label="Cortex details">
+          <div class="detail">
+            <span>Mode</span>
+            <span>Registry-driven RAG orchestration</span>
+          </div>
+          <div class="detail">
+            <span>Boundary</span>
+            <span>Authorized clients only. Public API docs stay closed in production.</span>
+          </div>
+          <div class="detail">
+            <span>Ready</span>
+            <span data-status-detail>Waiting for /health</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="map" aria-label="Applications powered by Cortex">
+        <svg viewBox="0 0 1000 650" role="img" aria-labelledby="map-title map-desc">
+          <title id="map-title">Cortex application network</title>
+          <desc id="map-desc">Cortex sits in the center and powers Portfolio, ReachFlow, and DocLens through animated dotted connections.</desc>
+
+          <path class="orbit" d="M500 102a220 220 0 1 1 0 440a220 220 0 1 1 0-440" />
+          <path class="orbit" d="M500 42a280 280 0 1 1 0 560a280 280 0 1 1 0-560" />
+
+          <path id="to-portfolio" class="route" d="M500 322 C420 286 330 200 214 138" />
+          <path id="to-reachflow" class="route slow" d="M500 322 C594 236 716 190 842 142" />
+          <path id="to-doclens" class="route" d="M500 322 C604 382 696 486 812 548" />
+
+          <circle class="packet" r="4">
+            <animateMotion dur="3.3s" repeatCount="indefinite" path="M500 322 C420 286 330 200 214 138" />
+          </circle>
+          <circle class="packet" r="4">
+            <animateMotion dur="3.9s" begin=".7s" repeatCount="indefinite" path="M500 322 C594 236 716 190 842 142" />
+          </circle>
+          <circle class="packet" r="4">
+            <animateMotion dur="3.5s" begin="1.1s" repeatCount="indefinite" path="M500 322 C604 382 696 486 812 548" />
+          </circle>
+
+          <g transform="translate(500 322)">
+            <circle class="node-ring" r="86" />
+            <circle class="orbit" r="64" />
+            <path class="icon" d="M-26 -6h52M-18 -24h36M-18 12h36M-8 -42h16M-8 30h16M-38 -18v24M38 -18v24" />
+            <text class="node-text" text-anchor="middle" y="56">Cortex</text>
+            <text class="node-sub" text-anchor="middle" y="73">RAG CORE</text>
+          </g>
+
+          <g transform="translate(214 138)">
+            <circle class="app-ring" r="52" />
+            <path class="icon" d="M-20 -13h40v30h-40zM-8 -13v-10h16v10M-20 -1h40" />
+            <text class="app-label" text-anchor="middle" y="76">Portfolio</text>
+            <text class="app-caption" text-anchor="middle" y="92">identity layer</text>
+          </g>
+
+          <g transform="translate(842 142)">
+            <circle class="app-ring" r="52" />
+            <path class="icon" d="M-24 12l48-24M-24 -12l48 24M-24 -12v24M8 -20l20 20-20 20" />
+            <text class="app-label" text-anchor="middle" y="76">ReachFlow</text>
+            <text class="app-caption" text-anchor="middle" y="92">workflow engine</text>
+          </g>
+
+          <g transform="translate(812 548)">
+            <circle class="app-ring" r="52" />
+            <path class="icon" d="M-17 -26h25l16 16v36h-41zM8 -26v16h16M-3 4a11 11 0 1 0 0 .1M6 13l14 14" />
+            <text class="app-label" text-anchor="middle" y="76">DocLens</text>
+            <text class="app-caption" text-anchor="middle" y="92">document intelligence</text>
+          </g>
+        </svg>
+      </div>
+    </section>
+  </main>
+  <script>
+    const value = document.querySelector("[data-status-value]");
+    const detail = document.querySelector("[data-status-detail]");
+    const mark = document.querySelector("[data-status-mark]");
+
+    async function refreshReadiness() {
+      try {
+        const response = await fetch("/health", { cache: "no-store", headers: { "Accept": "application/json" } });
+        const data = await response.json().catch(() => ({}));
+        if (response.ok) {
+          value.textContent = "Ready";
+          detail.textContent = "Cortex process is online.";
+          mark.classList.add("ready");
+          return;
+        }
+        value.textContent = "Degraded";
+        detail.textContent = data.detail || "Health check returned " + response.status + ".";
+        mark.classList.remove("ready");
+      } catch (error) {
+        value.textContent = "Unreachable";
+        detail.textContent = "Readiness check could not complete.";
+        mark.classList.remove("ready");
+      }
+    }
+
+    refreshReadiness();
+    window.setInterval(refreshReadiness, 30000);
+  </script>
+</body>
+</html>
+        """.strip()
+    )
 
 
 @app.get("/auth/session")
@@ -723,20 +999,6 @@ async def chat_endpoint(request: Request, stream: bool = True):
     user_id = request.state.user_id
     app_name = (payload.app_name or "").strip().lower()
     query = (payload.query or "").strip()
-    chat_logger.info(
-        "chat.request.received app=%s user_id=%s stream=%s thread_id=%s task=%s query_chars=%d query=%r doc_ids=%s request_messages=%s prompt_override_chars=%d llm_override=%s",
-        app_name,
-        user_id,
-        stream,
-        payload.thread_id,
-        payload.task,
-        len(query),
-        _preview(query, 500),
-        payload.doc_ids or [],
-        _message_debug(payload.messages),
-        len(payload.prompt_override or ""),
-        bool(payload.llm),
-    )
     if not app_name:
         raise HTTPException(status_code=400, detail="app_name is required")
     if not query:
@@ -751,14 +1013,6 @@ async def chat_endpoint(request: Request, stream: bool = True):
         thread = get_thread(payload.thread_id)
         if thread is None:
             doc_ids = payload.doc_ids or []
-            chat_logger.info(
-                "chat.thread.create_requested app=%s user_id=%s requested_thread_id=%s doc_ids=%s title=%r",
-                app_name,
-                user_id,
-                payload.thread_id,
-                doc_ids,
-                _auto_title(query),
-            )
             create_thread(
                 app_name=app_name,
                 user_id=user_id,
@@ -767,33 +1021,10 @@ async def chat_endpoint(request: Request, stream: bool = True):
                 thread_id=payload.thread_id,
             )
             thread = get_thread(payload.thread_id)
-            chat_logger.info(
-                "chat.thread.created app=%s user_id=%s thread_id=%s doc_ids=%s",
-                app_name,
-                user_id,
-                thread["id"] if thread else payload.thread_id,
-                doc_ids,
-            )
         else:
             if thread["user_id"] != user_id or thread["app_name"] != app_name:
-                chat_logger.warning(
-                    "chat.thread.forbidden requested_thread_id=%s token_user_id=%s thread_user_id=%s token_app=%s thread_app=%s",
-                    payload.thread_id,
-                    user_id,
-                    thread["user_id"],
-                    app_name,
-                    thread["app_name"],
-                )
                 raise HTTPException(status_code=403, detail="Thread does not belong to this user")
             doc_ids = thread["doc_ids"] or payload.doc_ids
-            chat_logger.info(
-                "chat.thread.loaded app=%s user_id=%s thread_id=%s doc_ids=%s summary=%s",
-                app_name,
-                user_id,
-                thread["id"],
-                doc_ids,
-                bool(thread.get("summary")),
-            )
     else:
         doc_ids = payload.doc_ids or []
         thread_id_new = create_thread(
@@ -803,14 +1034,6 @@ async def chat_endpoint(request: Request, stream: bool = True):
             title=_auto_title(query),
         )
         thread = get_thread(thread_id_new)
-        chat_logger.info(
-            "chat.thread.created app=%s user_id=%s thread_id=%s doc_ids=%s title=%r",
-            app_name,
-            user_id,
-            thread_id_new,
-            doc_ids,
-            _auto_title(query),
-        )
 
     # Check clarification state
     from app.conversation.state import get_clarification_pending, get_clarification_context, clear_clarification_pending
@@ -829,35 +1052,11 @@ async def chat_endpoint(request: Request, stream: bool = True):
     )
     if request_chat_history and len(request_chat_history) > len(stored_chat_history):
         chat_history = request_chat_history
-        history_source = "request_messages"
     else:
         chat_history = stored_chat_history
-        history_source = "thread_store"
-    chat_logger.info(
-        "chat.history.resolved app=%s user_id=%s thread_id=%s stored_count=%d request_count=%d used_count=%d source=%s summary=%s used_messages=%s",
-        app_name,
-        user_id,
-        thread["id"],
-        len(stored_chat_history),
-        len(request_chat_history),
-        len(chat_history),
-        history_source,
-        bool(summary),
-        _message_debug(chat_history),
-    )
     task = (payload.task or "chat").strip().lower()
 
     try:
-        chat_logger.info(
-            "chat.context.build.start app=%s user_id=%s thread_id=%s task=%s doc_ids=%s prompt_override_chars=%d voice_footer_chars=%d",
-            app_name,
-            user_id,
-            thread["id"],
-            task,
-            doc_ids,
-            len(payload.prompt_override or ""),
-            len(payload.voice_footer or ""),
-        )
         ctx = build_execution_context(
             app_name=app_name,
             user_id=user_id,
@@ -866,20 +1065,6 @@ async def chat_endpoint(request: Request, stream: bool = True):
             llm_override=llm_override,
             prompt_override=payload.prompt_override,
             voice_footer=payload.voice_footer,
-        )
-        chat_logger.info(
-            "chat.context.build.done app=%s user_id=%s thread_id=%s collection=%s retrieval_top_k=%s rerank_enabled=%s rerank_top_k=%s generation_context_tokens=%s grounding_mode=%s llm_provider=%s llm_model=%s",
-            app_name,
-            user_id,
-            thread["id"],
-            ctx.collection,
-            getattr(ctx.registry.retrieval, "top_k", None),
-            getattr(ctx.registry.reranking, "enabled", None),
-            getattr(ctx.registry.reranking, "top_k", None),
-            getattr(ctx.effective_generation, "max_context_tokens", None),
-            getattr(ctx.effective_generation, "grounding_mode", None),
-            ctx.llm_config.provider,
-            ctx.llm_config.model,
         )
     except HTTPException:
         raise
@@ -898,14 +1083,6 @@ async def chat_endpoint(request: Request, stream: bool = True):
             _clarification_marked = False
             try:
                 try:
-                    chat_logger.info(
-                        "chat.stream.start app=%s user_id=%s thread_id=%s query=%r history_count=%d",
-                        app_name,
-                        user_id,
-                        thread["id"],
-                        _preview(query, 500),
-                        len(chat_history),
-                    )
                     async for event_str in stream_answer(
                         ctx=ctx,
                         query=query,
@@ -927,77 +1104,20 @@ async def chat_endpoint(request: Request, stream: bool = True):
                                     if event_type_received == "delta":
                                         text = data.get("text", "")
                                         full_answer_parts.append(text)
-                                        chat_logger.info(
-                                            "chat.stream.delta app=%s user_id=%s thread_id=%s chars=%d preview=%r",
-                                            app_name,
-                                            user_id,
-                                            thread["id"],
-                                            len(str(text or "")),
-                                            _preview(text, 500),
-                                        )
                                     elif event_type_received == "clarification":
                                         text = data.get("text", "")
                                         full_answer_parts.append(text)
                                         was_clarification = True
-                                        chat_logger.info(
-                                            "chat.stream.clarification app=%s user_id=%s thread_id=%s chars=%d preview=%r",
-                                            app_name,
-                                            user_id,
-                                            thread["id"],
-                                            len(str(text or "")),
-                                            _preview(text, 500),
-                                        )
                                     elif event_type_received == "citations":
                                         citations_list = data.get("citations", [])
-                                        chat_logger.info(
-                                            "chat.stream.citations app=%s user_id=%s thread_id=%s count=%d citations=%s",
-                                            app_name,
-                                            user_id,
-                                            thread["id"],
-                                            len(citations_list or []),
-                                            citations_list,
-                                        )
-                                    elif event_type_received == "meta":
-                                        chat_logger.info(
-                                            "chat.stream.meta app=%s user_id=%s thread_id=%s meta=%s",
-                                            app_name,
-                                            user_id,
-                                            thread["id"],
-                                            data,
-                                        )
-                                    elif event_type_received == "done":
-                                        chat_logger.info(
-                                            "chat.stream.done_event app=%s user_id=%s thread_id=%s data=%s",
-                                            app_name,
-                                            user_id,
-                                            thread["id"],
-                                            data,
-                                        )
                         except Exception:
                             pass
                 except Exception as exc:
-                    chat_logger.exception(
-                        "chat.stream.error app=%s user_id=%s thread_id=%s error=%s",
-                        app_name,
-                        user_id,
-                        thread["id"],
-                        exc,
-                    )
                     yield error_event(str(exc), code="stream_error")
 
                 # Persist thread messages after stream completes
                 try:
                     full_answer = "".join(full_answer_parts)
-                    summary_updated = False
-                    chat_logger.info(
-                        "chat.persist.start app=%s user_id=%s thread_id=%s user_query_chars=%d assistant_chars=%d was_clarification=%s",
-                        app_name,
-                        user_id,
-                        thread["id"],
-                        len(query),
-                        len(full_answer),
-                        was_clarification,
-                    )
                     append_message(thread["id"], "user", query)
                     append_message(
                         thread["id"],
@@ -1025,18 +1145,8 @@ async def chat_endpoint(request: Request, stream: bool = True):
                                 new_summary = summarize_old_turns(to_summarize, summary, llm_inst)
                                 if new_summary:
                                     update_summary(thread["id"], new_summary, cutoff)
-                                    summary_updated = True
                             except Exception as summ_exc:
                                 logger.warning("Summarization failed (best-effort): %s", summ_exc)
-                    chat_logger.info(
-                        "chat.persist.done app=%s user_id=%s thread_id=%s total_messages=%d summary_updated=%s answer_preview=%r",
-                        app_name,
-                        user_id,
-                        thread["id"],
-                        count_messages(thread["id"]),
-                        summary_updated,
-                        _preview(full_answer, 500),
-                    )
                 except Exception as exc:
                     logger.warning("Post-stream thread persistence failed: %s", exc)
             finally:

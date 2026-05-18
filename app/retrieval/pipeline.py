@@ -8,14 +8,6 @@ from typing import Any, Dict, List, Optional
 from app.context import ExecutionContext
 
 logger = logging.getLogger(__name__)
-retrieval_logger = logging.getLogger("cortex.chat.retrieval")
-
-
-def _preview(value: Any, limit: int = 500) -> str:
-    text = str(value or "").replace("\n", "\\n").strip()
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}..."
 
 
 @dataclass
@@ -56,21 +48,6 @@ def run_retrieval(
     retrieval_cfg = ctx.registry.retrieval
     conv_cfg = ctx.registry.conversation
     policy = conv_cfg.clarification_policy
-    retrieval_logger.info(
-        "retrieval.start app=%s user_id=%s collection=%s query_chars=%d query=%r top_k=%s rerank_enabled=%s candidate_cap=%s doc_ids=%s history_summary=%s last_assistant=%r clarification_reply=%s",
-        ctx.app_name,
-        ctx.user_id,
-        ctx.collection,
-        len(query),
-        _preview(query, 900),
-        retrieval_cfg.top_k,
-        ctx.registry.reranking.enabled,
-        ctx.registry.reranking.candidate_cap,
-        ctx.doc_ids or [],
-        bool(history_summary),
-        _preview(last_assistant_msg, 500),
-        clarification_reply,
-    )
 
     # Step 1: Resolve components and verify user has documents before any analysis.
     # Doing this first avoids firing clarification when the real answer is "no docs uploaded".
@@ -79,50 +56,17 @@ def run_retrieval(
 
     if vs is None or embedder is None:
         logger.warning("No vector store or embedder in ctx.components — returning empty result")
-        retrieval_logger.warning(
-            "retrieval.components.missing app=%s user_id=%s vector_store=%s embedder=%s",
-            ctx.app_name,
-            ctx.user_id,
-            bool(vs),
-            bool(embedder),
-        )
         return RetrievalResult()
 
     user_docs = vs.list_docs(ctx.collection, ctx.user_id)
-    retrieval_logger.info(
-        "retrieval.docs.loaded app=%s user_id=%s collection=%s doc_count=%d docs=%s",
-        ctx.app_name,
-        ctx.user_id,
-        ctx.collection,
-        len(user_docs or []),
-        user_docs,
-    )
     if not user_docs:
-        retrieval_logger.warning(
-            "retrieval.docs.empty app=%s user_id=%s collection=%s",
-            ctx.app_name,
-            ctx.user_id,
-            ctx.collection,
-        )
         return RetrievalResult()
 
     # Step 2: Query analysis (only runs if user has documents worth searching)
     analyzer_result: Dict[str, Any] = {"is_ambiguous": False, "clarifying_question": None, "rewrites": [], "entities": [], "query_type": "factual"}
     if conv_cfg.use_query_analyzer and not clarification_reply:
         from app.retrieval.query_analyzer import analyze_query
-        retrieval_logger.info(
-            "retrieval.analyzer.waiting app=%s user_id=%s query=%r",
-            ctx.app_name,
-            ctx.user_id,
-            _preview(query, 500),
-        )
         analyzer_result = analyze_query(ctx, query, last_assistant_msg=last_assistant_msg)
-        retrieval_logger.info(
-            "retrieval.analyzer.done app=%s user_id=%s result=%s",
-            ctx.app_name,
-            ctx.user_id,
-            analyzer_result,
-        )
 
     rewrites = [r for r in (analyzer_result.get("rewrites") or []) if r and r.strip() and r != query]
 
@@ -133,13 +77,6 @@ def run_retrieval(
         and not clarification_reply
     ):
         clarifying_q = analyzer_result.get("clarifying_question") or "Could you provide more context?"
-        retrieval_logger.info(
-            "retrieval.clarification.required app=%s user_id=%s question=%r analyzer=%s",
-            ctx.app_name,
-            ctx.user_id,
-            _preview(clarifying_q, 500),
-            analyzer_result,
-        )
         return RetrievalResult(
             needs_clarification=True,
             clarifying_question=clarifying_q,
@@ -150,22 +87,9 @@ def run_retrieval(
     queries = [query] + rewrites
     if retrieval_cfg.hyde and not rewrites:
         from app.retrieval.hyde import generate_hypothetical_doc
-        retrieval_logger.info(
-            "retrieval.hyde.waiting app=%s user_id=%s query=%r",
-            ctx.app_name,
-            ctx.user_id,
-            _preview(query, 500),
-        )
         hyde_text = generate_hypothetical_doc(ctx, query)
         if hyde_text and hyde_text != query:
             queries.append(hyde_text)
-        retrieval_logger.info(
-            "retrieval.hyde.done app=%s user_id=%s added=%s hyde=%r",
-            ctx.app_name,
-            ctx.user_id,
-            bool(hyde_text and hyde_text != query),
-            _preview(hyde_text, 700),
-        )
 
     requested_doc_ids = ctx.doc_ids or None
     candidate_cap = retrieval_cfg.top_k * 3 if not ctx.registry.reranking.enabled else ctx.registry.reranking.candidate_cap
@@ -174,15 +98,6 @@ def run_retrieval(
     all_chunks: List[Dict] = []
     for q in queries:
         try:
-            retrieval_logger.info(
-                "retrieval.search.waiting app=%s user_id=%s query_variant=%r candidate_cap=%d doc_filter=%s",
-                ctx.app_name,
-                ctx.user_id,
-                _preview(q, 700),
-                candidate_cap,
-                requested_doc_ids,
-            )
-            t_search = time.monotonic()
             query_vec = embedder.embed_query(q)
             sparse_vec = None
             if embedder.supports_sparse:
@@ -203,33 +118,9 @@ def run_retrieval(
                 alpha=retrieval_cfg.alpha,
                 metadata_filter=retrieval_cfg.metadata_filter,
             )
-            retrieval_logger.info(
-                "retrieval.search.done app=%s user_id=%s returned=%d ms=%.1f chunk_refs=%s",
-                ctx.app_name,
-                ctx.user_id,
-                len(chunks or []),
-                (time.monotonic() - t_search) * 1000,
-                [
-                    {
-                        "doc_id": c.get("doc_id"),
-                        "chunk_id": c.get("chunk_id"),
-                        "section": c.get("section"),
-                        "score": c.get("score"),
-                        "preview": _preview(c.get("text"), 220),
-                    }
-                    for c in (chunks or [])[:8]
-                ],
-            )
             all_chunks.extend(chunks)
         except Exception as exc:
             logger.warning("Search failed for query variant %r: %s", q[:60], exc)
-            retrieval_logger.exception(
-                "retrieval.search.error app=%s user_id=%s query_variant=%r error=%s",
-                ctx.app_name,
-                ctx.user_id,
-                _preview(q, 700),
-                exc,
-            )
 
     # Deduplicate
     seen: Dict[str, Dict] = {}
@@ -241,20 +132,8 @@ def run_retrieval(
             seen[key] = c
     merged = list(seen.values())
     retrieved_count = len(merged)
-    retrieval_logger.info(
-        "retrieval.dedup.done app=%s user_id=%s raw_chunks=%d deduped=%d",
-        ctx.app_name,
-        ctx.user_id,
-        len(all_chunks),
-        retrieved_count,
-    )
 
     if not merged:
-        retrieval_logger.warning(
-            "retrieval.empty app=%s user_id=%s after=dedupe",
-            ctx.app_name,
-            ctx.user_id,
-        )
         return RetrievalResult(retrieved_count=0)
 
     # Step 5: Reranking
@@ -264,14 +143,6 @@ def run_retrieval(
 
     if reranking_cfg.enabled and ctx.components and ctx.components.reranker:
         t_rerank = time.monotonic()
-        retrieval_logger.info(
-            "retrieval.rerank.waiting app=%s user_id=%s candidates=%d top_k=%d candidate_cap=%d",
-            ctx.app_name,
-            ctx.user_id,
-            len(merged),
-            reranking_cfg.top_k,
-            reranking_cfg.candidate_cap,
-        )
         merged = ctx.components.reranker.rerank(
             query=query,
             chunks=merged,
@@ -280,44 +151,10 @@ def run_retrieval(
         )
         rerank_ms = (time.monotonic() - t_rerank) * 1000
         reranked_count = len(merged)
-        retrieval_logger.info(
-            "retrieval.rerank.done app=%s user_id=%s selected=%d ms=%.1f chunks=%s",
-            ctx.app_name,
-            ctx.user_id,
-            reranked_count,
-            rerank_ms,
-            [
-                {
-                    "doc_id": c.get("doc_id"),
-                    "chunk_id": c.get("chunk_id"),
-                    "section": c.get("section"),
-                    "score": c.get("score"),
-                    "rerank_score": c.get("rerank_score"),
-                    "preview": _preview(c.get("text"), 220),
-                }
-                for c in merged[:8]
-            ],
-        )
     else:
         merged.sort(key=lambda c: c.get("score", 0.0), reverse=True)
         merged = merged[:retrieval_cfg.top_k]
         reranked_count = len(merged)
-        retrieval_logger.info(
-            "retrieval.rank.done app=%s user_id=%s selected=%d chunks=%s",
-            ctx.app_name,
-            ctx.user_id,
-            reranked_count,
-            [
-                {
-                    "doc_id": c.get("doc_id"),
-                    "chunk_id": c.get("chunk_id"),
-                    "section": c.get("section"),
-                    "score": c.get("score"),
-                    "preview": _preview(c.get("text"), 220),
-                }
-                for c in merged[:8]
-            ],
-        )
 
     # Step 5b: Score threshold filter
     score_threshold = getattr(retrieval_cfg, "score_threshold", 0.0)
@@ -332,21 +169,7 @@ def run_retrieval(
                 "Score threshold %.3f dropped %d/%d chunks",
                 score_threshold, before_filter - len(merged), before_filter,
             )
-            retrieval_logger.info(
-                "retrieval.threshold.applied app=%s user_id=%s threshold=%.3f dropped=%d kept=%d",
-                ctx.app_name,
-                ctx.user_id,
-                score_threshold,
-                before_filter - len(merged),
-                len(merged),
-            )
         if not merged:
-            retrieval_logger.warning(
-                "retrieval.empty app=%s user_id=%s after=score_threshold threshold=%.3f",
-                ctx.app_name,
-                ctx.user_id,
-                score_threshold,
-            )
             return RetrievalResult(
                 retrieved_count=retrieved_count,
                 reranked_count=0,
@@ -356,22 +179,7 @@ def run_retrieval(
     # Step 6: Neighbor expansion
     if retrieval_cfg.expand_neighbors:
         from app.retrieval.neighbor_expansion import expand_neighbors
-        before_neighbors = len(merged)
-        retrieval_logger.info(
-            "retrieval.neighbors.waiting app=%s user_id=%s chunks=%d budget_tokens=%d",
-            ctx.app_name,
-            ctx.user_id,
-            before_neighbors,
-            retrieval_cfg.neighbor_budget_tokens,
-        )
         merged = expand_neighbors(ctx, merged, budget_tokens=retrieval_cfg.neighbor_budget_tokens)
-        retrieval_logger.info(
-            "retrieval.neighbors.done app=%s user_id=%s before=%d after=%d",
-            ctx.app_name,
-            ctx.user_id,
-            before_neighbors,
-            len(merged),
-        )
 
     # Step 7: Confidence
     from app.retrieval.confidence import compute_confidence
@@ -383,27 +191,6 @@ def run_retrieval(
 
     total_ms = (time.monotonic() - t0) * 1000
     discovered_doc_ids = sorted({str(c["doc_id"]) for c in merged if c.get("doc_id")})
-    retrieval_logger.info(
-        "retrieval.done app=%s user_id=%s retrieved_count=%d reranked_count=%d confidence=%s doc_ids=%s total_ms=%.1f final_chunks=%s",
-        ctx.app_name,
-        ctx.user_id,
-        retrieved_count,
-        reranked_count,
-        confidence,
-        discovered_doc_ids,
-        total_ms,
-        [
-            {
-                "doc_id": c.get("doc_id"),
-                "chunk_id": c.get("chunk_id"),
-                "section": c.get("section"),
-                "score": c.get("score"),
-                "rerank_score": c.get("rerank_score"),
-                "preview": _preview(c.get("text"), 240),
-            }
-            for c in merged[:8]
-        ],
-    )
 
     return RetrievalResult(
         chunks=merged,

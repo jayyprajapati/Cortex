@@ -11,31 +11,6 @@ from app.llm.factory import get_llm
 from app.observability.logger import cortex_logger
 
 logger = logging.getLogger(__name__)
-chat_pipeline_logger = logging.getLogger("cortex.chat.pipeline")
-
-
-def _preview(value: Any, limit: int = 900) -> str:
-    text = str(value or "").replace("\n", "\\n").strip()
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}..."
-
-
-def _chunk_log_view(chunks: List[dict], limit: int = 6) -> List[dict]:
-    result: List[dict] = []
-    for idx, chunk in enumerate(chunks[:limit], start=1):
-        result.append({
-            "index": idx,
-            "doc_id": chunk.get("doc_id"),
-            "chunk_id": chunk.get("chunk_id"),
-            "section": chunk.get("section"),
-            "page": chunk.get("page"),
-            "score": chunk.get("score"),
-            "rerank_score": chunk.get("rerank_score"),
-            "text_chars": len(str(chunk.get("text") or "")),
-            "text_preview": _preview(chunk.get("text"), 500),
-        })
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -542,18 +517,6 @@ async def stream_answer(
     from app.retrieval.pipeline import run_retrieval
 
     gen = ctx.effective_generation
-    chat_pipeline_logger.info(
-        "pipeline.chat.start app=%s user_id=%s thread_id=%s query_chars=%d query=%r history_count=%d summary=%s prompt_override=%s max_context_tokens=%d",
-        ctx.app_name,
-        ctx.user_id,
-        thread_id,
-        len(query),
-        _preview(query, 500),
-        len(chat_history or []),
-        bool(summary),
-        bool(ctx.prompt_override),
-        gen.max_context_tokens,
-    )
 
     # Resolve last assistant message for query analysis context
     last_assistant = None
@@ -568,17 +531,6 @@ async def stream_answer(
     else:
         retrieval_query = _history_aware_retrieval_query(query, chat_history, summary)
 
-    chat_pipeline_logger.info(
-        "pipeline.retrieval.waiting app=%s user_id=%s thread_id=%s original_query=%r retrieval_query_chars=%d retrieval_query=%r last_assistant=%r",
-        ctx.app_name,
-        ctx.user_id,
-        thread_id,
-        _preview(query, 500),
-        len(retrieval_query),
-        _preview(retrieval_query, 900),
-        _preview(last_assistant, 500),
-    )
-
     import time as _time
     t_retrieve = _time.monotonic()
 
@@ -591,29 +543,10 @@ async def stream_answer(
             clarification_reply=clarification_reply,
         )
     except Exception as exc:
-        chat_pipeline_logger.exception(
-            "pipeline.retrieval.error app=%s user_id=%s thread_id=%s error=%s",
-            ctx.app_name,
-            ctx.user_id,
-            thread_id,
-            exc,
-        )
         yield error_event(str(exc), code="retrieval_error")
         return
 
     retrieve_ms = (_time.monotonic() - t_retrieve) * 1000
-    chat_pipeline_logger.info(
-        "pipeline.retrieval.done app=%s user_id=%s thread_id=%s retrieved_count=%d reranked_count=%d confidence=%s needs_clarification=%s rewrites=%s ms=%.1f",
-        ctx.app_name,
-        ctx.user_id,
-        thread_id,
-        retrieval_result.retrieved_count,
-        retrieval_result.reranked_count,
-        retrieval_result.confidence,
-        retrieval_result.needs_clarification,
-        retrieval_result.rewrites,
-        retrieve_ms,
-    )
 
     # Emit meta
     yield meta_event({
@@ -629,24 +562,8 @@ async def stream_answer(
         clarifying_q = retrieval_result.clarifying_question or "Could you provide more context?"
         clarification_text = _render_clarification_prompt(query, clarifying_q, gen)
         llm = get_llm(ctx.llm_config)
-        chat_pipeline_logger.info(
-            "pipeline.clarification.waiting app=%s user_id=%s thread_id=%s prompt_chars=%d clarifying_question=%r",
-            ctx.app_name,
-            ctx.user_id,
-            thread_id,
-            len(clarification_text),
-            _preview(clarifying_q, 500),
-        )
         clarification_answer = llm.generate(clarification_text, temperature=0.7)
         clarification_output = str(clarification_answer or "").strip()
-        chat_pipeline_logger.info(
-            "pipeline.clarification.done app=%s user_id=%s thread_id=%s answer_chars=%d answer=%r",
-            ctx.app_name,
-            ctx.user_id,
-            thread_id,
-            len(clarification_output),
-            _preview(clarification_output, 900),
-        )
         yield clarification_event(clarification_output)
         yield done_event({"type": "clarification", "thread_id": thread_id})
         return
@@ -654,38 +571,13 @@ async def stream_answer(
     # Build context
     chunks = _dedupe_chunks(retrieval_result.chunks)
     context_str = _build_context_str(chunks, max_context_tokens=gen.max_context_tokens)
-    chat_pipeline_logger.info(
-        "pipeline.context.built app=%s user_id=%s thread_id=%s chunks=%d context_chars=%d chunks_detail=%s",
-        ctx.app_name,
-        ctx.user_id,
-        thread_id,
-        len(chunks),
-        len(context_str),
-        _chunk_log_view(chunks),
-    )
 
     if not context_str.strip():
         # No relevant context — let LLM respond naturally (no hardcoded refusal)
         no_context_prompt = _render_prompt(query, "", gen, history=chat_history, summary=summary)
         llm = get_llm(ctx.llm_config)
-        chat_pipeline_logger.info(
-            "pipeline.llm.waiting_no_context app=%s user_id=%s thread_id=%s prompt_chars=%d prompt=%r",
-            ctx.app_name,
-            ctx.user_id,
-            thread_id,
-            len(no_context_prompt),
-            _preview(no_context_prompt, 1800),
-        )
         answer = llm.generate(no_context_prompt, temperature=gen.temperature)
         answer_text = str(answer or "").strip()
-        chat_pipeline_logger.info(
-            "pipeline.llm.done_no_context app=%s user_id=%s thread_id=%s answer_chars=%d answer=%r",
-            ctx.app_name,
-            ctx.user_id,
-            thread_id,
-            len(answer_text),
-            _preview(answer_text, 1200),
-        )
         yield delta_event(answer_text)
         yield citations_event([])
         yield done_event({"grounded": False, "thread_id": thread_id})
@@ -693,39 +585,14 @@ async def stream_answer(
 
     prompt = _render_prompt(query, context_str, gen, history=chat_history, summary=summary)
     llm = get_llm(ctx.llm_config)
-    chat_pipeline_logger.info(
-        "pipeline.llm.waiting app=%s user_id=%s thread_id=%s prompt_chars=%d context_chars=%d prompt=%r",
-        ctx.app_name,
-        ctx.user_id,
-        thread_id,
-        len(prompt),
-        len(context_str),
-        _preview(prompt, 2200),
-    )
 
     t0 = _time.monotonic()
     try:
         answer = generate_with_output_contract(llm, prompt, gen)
     except Exception as exc:
-        chat_pipeline_logger.exception(
-            "pipeline.llm.error app=%s user_id=%s thread_id=%s error=%s",
-            ctx.app_name,
-            ctx.user_id,
-            thread_id,
-            exc,
-        )
         yield error_event(str(exc), code="generation_error")
         return
     generate_ms = (_time.monotonic() - t0) * 1000
-    chat_pipeline_logger.info(
-        "pipeline.llm.done app=%s user_id=%s thread_id=%s answer_chars=%d generate_ms=%.1f answer=%r",
-        ctx.app_name,
-        ctx.user_id,
-        thread_id,
-        len(_flatten_to_text(answer)),
-        generate_ms,
-        _preview(_flatten_to_text(answer), 1200),
-    )
 
     sources = _build_public_sources(chunks)
     mode = getattr(gen, "grounding_mode", "off") or "off"
@@ -734,14 +601,6 @@ async def stream_answer(
 
     if mode in {"strict", "truthful"} and not grounding["grounded"]:
         logger.warning("%s grounding failed: unverified=%s", mode, grounding["unverified"][:5])
-        chat_pipeline_logger.warning(
-            "pipeline.grounding.failed app=%s user_id=%s thread_id=%s mode=%s unverified=%s",
-            ctx.app_name,
-            ctx.user_id,
-            thread_id,
-            mode,
-            grounding["unverified"][:12],
-        )
         correction = _build_grounding_correction_prompt(
             prompt,
             query,
@@ -749,53 +608,20 @@ async def stream_answer(
             grounding["unverified"],
         )
         t_corr = _time.monotonic()
-        chat_pipeline_logger.info(
-            "pipeline.grounding.correction.waiting app=%s user_id=%s thread_id=%s prompt_chars=%d prompt=%r",
-            ctx.app_name,
-            ctx.user_id,
-            thread_id,
-            len(correction),
-            _preview(correction, 2200),
-        )
         corrected = llm.generate(correction, temperature=gen.temperature)
         generate_ms += (_time.monotonic() - t_corr) * 1000
         corrected_text = str(corrected or "").strip()
         if corrected_text:
             answer = corrected_text
         grounding = _check_grounding(answer, chunks, mode, unverified_threshold=_unverified_thresh)
-        chat_pipeline_logger.info(
-            "pipeline.grounding.correction.done app=%s user_id=%s thread_id=%s grounded=%s answer_chars=%d answer=%r",
-            ctx.app_name,
-            ctx.user_id,
-            thread_id,
-            grounding["grounded"],
-            len(_flatten_to_text(answer)),
-            _preview(_flatten_to_text(answer), 1200),
-        )
         if not grounding["grounded"]:
             answer = "I don't have enough information in the retrieved notes to answer that accurately."
             grounding = {"grounded": False, "unverified": grounding["unverified"]}
-            chat_pipeline_logger.warning(
-                "pipeline.grounding.fallback app=%s user_id=%s thread_id=%s unverified=%s",
-                ctx.app_name,
-                ctx.user_id,
-                thread_id,
-                grounding["unverified"][:12],
-            )
 
     answer_text = answer if isinstance(answer, str) else json.dumps(answer)
     yield delta_event(answer_text)
 
     citations = extract_citations(answer_text, sources)
-    chat_pipeline_logger.info(
-        "pipeline.output.ready app=%s user_id=%s thread_id=%s grounded=%s citations=%d answer_chars=%d",
-        ctx.app_name,
-        ctx.user_id,
-        thread_id,
-        grounding["grounded"],
-        len(citations),
-        len(answer_text),
-    )
     yield citations_event(citations)
 
     yield done_event({
@@ -818,16 +644,6 @@ def generate_answer(
     from app.retrieval.pipeline import run_retrieval
     gen = ctx.effective_generation
     mode = getattr(gen, "grounding_mode", "off") or "off"
-    chat_pipeline_logger.info(
-        "pipeline.chat_json.start app=%s user_id=%s thread_id=%s query_chars=%d query=%r history_count=%d summary=%s",
-        ctx.app_name,
-        ctx.user_id,
-        thread_id,
-        len(query),
-        _preview(query, 500),
-        len(chat_history or []),
-        bool(summary),
-    )
 
     last_assistant = None
     if chat_history:
@@ -841,14 +657,6 @@ def generate_answer(
     else:
         retrieval_query = _history_aware_retrieval_query(query, chat_history, summary)
 
-    chat_pipeline_logger.info(
-        "pipeline_json.retrieval.waiting app=%s user_id=%s thread_id=%s retrieval_query_chars=%d retrieval_query=%r",
-        ctx.app_name,
-        ctx.user_id,
-        thread_id,
-        len(retrieval_query),
-        _preview(retrieval_query, 900),
-    )
     t_retrieve = time.monotonic()
     retrieval_result = run_retrieval(
         ctx=ctx,
@@ -858,38 +666,13 @@ def generate_answer(
         clarification_reply=clarification_reply,
     )
     retrieve_ms = (time.monotonic() - t_retrieve) * 1000
-    chat_pipeline_logger.info(
-        "pipeline_json.retrieval.done app=%s user_id=%s thread_id=%s retrieved_count=%d reranked_count=%d confidence=%s needs_clarification=%s ms=%.1f",
-        ctx.app_name,
-        ctx.user_id,
-        thread_id,
-        retrieval_result.retrieved_count,
-        retrieval_result.reranked_count,
-        retrieval_result.confidence,
-        retrieval_result.needs_clarification,
-        retrieve_ms,
-    )
 
     # Handle clarification
     if retrieval_result.needs_clarification:
         clarifying_q = retrieval_result.clarifying_question or "Could you provide more context?"
         clarification_text = _render_clarification_prompt(query, clarifying_q, gen)
         llm = get_llm(ctx.llm_config)
-        chat_pipeline_logger.info(
-            "pipeline_json.clarification.waiting app=%s user_id=%s thread_id=%s prompt_chars=%d",
-            ctx.app_name,
-            ctx.user_id,
-            thread_id,
-            len(clarification_text),
-        )
         clarification_answer = llm.generate(clarification_text, temperature=0.7)
-        chat_pipeline_logger.info(
-            "pipeline_json.clarification.done app=%s user_id=%s thread_id=%s answer=%r",
-            ctx.app_name,
-            ctx.user_id,
-            thread_id,
-            _preview(clarification_answer, 900),
-        )
         return {
             "answer": str(clarification_answer or "").strip(),
             "grounded": False,
@@ -905,25 +688,8 @@ def generate_answer(
 
     chunks = _dedupe_chunks(retrieval_result.chunks)
     context_str = _build_context_str(chunks, max_context_tokens=gen.max_context_tokens)
-    chat_pipeline_logger.info(
-        "pipeline_json.context.built app=%s user_id=%s thread_id=%s chunks=%d context_chars=%d chunks_detail=%s",
-        ctx.app_name,
-        ctx.user_id,
-        thread_id,
-        len(chunks),
-        len(context_str),
-        _chunk_log_view(chunks),
-    )
 
     if not context_str.strip():
-        chat_pipeline_logger.warning(
-            "pipeline_json.context.empty app=%s user_id=%s thread_id=%s retrieved_count=%d reranked_count=%d",
-            ctx.app_name,
-            ctx.user_id,
-            thread_id,
-            retrieval_result.retrieved_count,
-            retrieval_result.reranked_count,
-        )
         return {
             "answer": "I don't have enough information in my knowledge base to answer this question.",
             "grounded": False,
@@ -939,26 +705,9 @@ def generate_answer(
 
     prompt = _render_prompt(query, context_str, gen, history=chat_history, summary=summary)
     llm = get_llm(ctx.llm_config)
-    chat_pipeline_logger.info(
-        "pipeline_json.llm.waiting app=%s user_id=%s thread_id=%s prompt_chars=%d prompt=%r",
-        ctx.app_name,
-        ctx.user_id,
-        thread_id,
-        len(prompt),
-        _preview(prompt, 2200),
-    )
     t0 = time.monotonic()
     answer = generate_with_output_contract(llm, prompt, gen)
     generate_ms = (time.monotonic() - t0) * 1000
-    chat_pipeline_logger.info(
-        "pipeline_json.llm.done app=%s user_id=%s thread_id=%s answer_chars=%d generate_ms=%.1f answer=%r",
-        ctx.app_name,
-        ctx.user_id,
-        thread_id,
-        len(_flatten_to_text(answer)),
-        generate_ms,
-        _preview(_flatten_to_text(answer), 1200),
-    )
 
     # P1.1: Citation validation (markdown only, when enabled)
     citation_confidence_low = False

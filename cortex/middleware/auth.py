@@ -18,8 +18,6 @@ logger = logging.getLogger(__name__)
 _EXEMPT_PATHS = frozenset([
     "/",
     "/health",
-    "/ready",
-    "/llm/ping",
 ])
 
 _EXEMPT_PREFIXES = (
@@ -37,10 +35,23 @@ def _get_jwks_url() -> Optional[str]:
     return os.getenv("JWT_JWKS_URL")
 
 
+def _get_hs256_secret() -> Optional[str]:
+    return os.getenv("CORTEX_JWT_SECRET") or os.getenv("JWT_SECRET")
+
+
 def _verify_token(token: str) -> dict:
     """Verify JWT and return claims. Raises ValueError on failure."""
     public_key = _get_public_key()
     jwks_url = _get_jwks_url()
+    hs256_secret = _get_hs256_secret()
+
+    if hs256_secret:
+        try:
+            return jwt.decode(token, hs256_secret, algorithms=["HS256"])
+        except jwt.ExpiredSignatureError:
+            raise ValueError("Token expired")
+        except jwt.InvalidTokenError as e:
+            raise ValueError(f"Invalid token: {e}") from e
 
     if not public_key and not jwks_url:
         # Dev mode: if neither is configured, decode without verification.
@@ -52,7 +63,7 @@ def _verify_token(token: str) -> dict:
             except Exception as e:
                 raise ValueError(f"Invalid JWT format: {e}") from e
         raise ValueError(
-            "JWT verification not configured: set JWT_PUBLIC_KEY or JWT_JWKS_URL"
+            "JWT verification not configured: set CORTEX_JWT_SECRET, JWT_PUBLIC_KEY, or JWT_JWKS_URL"
         )
 
     if public_key:

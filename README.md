@@ -188,10 +188,7 @@ curl -X POST http://localhost:8000/apps/register \
 GET /
 ```
 
-Response:
-```json
-{ "message": "Cortex RAG Engine v2.0 — registry-driven" }
-```
+Returns a minimal HTML home page for the Cortex service. Use `GET /health` for machine-readable liveness checks.
 
 ---
 
